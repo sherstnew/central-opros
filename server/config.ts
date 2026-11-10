@@ -20,8 +20,19 @@ export const config = {
   vapidPrivate: process.env.VAPID_PRIVATE_KEY || "",
   vapidSubject: process.env.VAPID_SUBJECT || process.env.APP_ORIGIN || "",
 };
+if (config.production) {
+  const problems: string[] = [];
+  if (config.demo) problems.push("MONGODB_URI: не задан");
+  if (!config.passwordHash) problems.push("OWNER_PASSWORD_HASH: не задан");
+  if (!/^[a-f0-9]{64}$/i.test(config.encryptionKey))
+    problems.push("ENCRYPTION_KEY: нужны ровно 64 шестнадцатеричных символа");
+  if (!config.origin.startsWith("https://"))
+    problems.push("APP_ORIGIN: укажи https://твой-домен без / в конце");
+  if (problems.length)
+    throw new Error(`Ошибка окружения production: ${problems.join("; ")}`);
+}
 if (
-  !config.demo &&
+  !config.production && !config.demo &&
   (!config.passwordHash || !/^([a-f0-9]{64})$/i.test(config.encryptionKey))
 )
   throw new Error(
@@ -36,13 +47,3 @@ if (
   config.maxMessages > 10000
 )
   throw new Error("Invalid MAX_AI_CALLS_PER_RUN or MAX_MESSAGES_PER_SOURCE");
-if (
-  config.production &&
-  (config.demo ||
-    !config.passwordHash ||
-    !/^([a-f0-9]{64})$/i.test(config.encryptionKey) ||
-    !config.origin.startsWith("https://"))
-)
-  throw new Error(
-    "Production requires MONGODB_URI, OWNER_PASSWORD_HASH, ENCRYPTION_KEY (64 hex), and HTTPS APP_ORIGIN",
-  );
