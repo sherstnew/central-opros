@@ -57,6 +57,19 @@ npm run setup
 
 Сессия Telegram шифруется AES-256-GCM; код и пароль 2FA не сохраняются. Не меняй ключ шифрования в `.env.secrets` без переподключения Telegram. Не открывай API напрямую в интернет в обход Caddy. Sites/Cloudflare Workers не подходят для этого MTProto worker; нужен обычный VPS.
 
+## Развёртывание в Dokploy
+
+1. Локально выполни `npm run setup`. Если уже выполнял — используй существующий `.env.secrets`: повторно создавать ключи не нужно.
+2. В проекте Dokploy создай сервис **Docker Compose**, подключи репозиторий и укажи **Compose Path**: `compose.dokploy.yaml`. Этот вариант содержит app и worker; HTTPS обслуживает Dokploy.
+3. В **Environment** вставь содержимое локального `.env`, затем добавь все четыре строки из `.env.secrets`: `OWNER_PASSWORD_HASH`, `ENCRYPTION_KEY`, `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`. Кавычки у значений можно сохранить. Отдельный файл `.env.secrets` на сервере не требуется.
+4. Там же замени `APP_ORIGIN` на `https://твой-домен` без завершающего `/`. `DOMAIN` для Dokploy не нужен. Остальные заполненные значения MongoDB, ProxyAPI и Telegram сохрани.
+5. Создай DNS A-запись домена на IP сервера. В **Domains → Add Domain** укажи домен, сервис **app**, **Container Port 3001**, путь `/`, включи HTTPS и сертификат Let's Encrypt.
+6. Нажми **Deploy**. После изменения домена или переменных снова выполняй Deploy. Открой сайт и войди с паролем, заданным при локальном setup; Telegram подключается через интерфейс сайта.
+
+Публиковать порт 3001 на хосте не требуется. Worker работает внутри Compose без отдельного домена. Сохраняй исходные ключи при обновлениях, чтобы продолжали работать Telegram-сессия и push-подписки.
+
+Документация Dokploy: [Environment для Compose](https://docs.dokploy.com/docs/core/docker-compose), [Domains для Compose](https://docs.dokploy.com/docs/core/docker-compose/domains).
+
 ## Как работает подбор
 
 - По умолчанию сбор в 03:00, уведомление в 08:00, часовой пояс Europe/Moscow; время меняется в интерфейсе.
