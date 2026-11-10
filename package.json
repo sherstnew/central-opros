@@ -1,0 +1,53 @@
+{
+  "name": "central-opros",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "tsx scripts/setup.ts",
+    "dev": "concurrently -k \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:web": "vite --host 127.0.0.1",
+    "dev:api": "tsx watch server/index.ts",
+    "worker": "tsx server/worker.ts",
+    "build": "tsc --noEmit && tsc -p tsconfig.sw.json && vite build",
+    "start": "tsx server/index.ts",
+    "test": "vitest run",
+    "password:hash": "tsx scripts/password.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/rate-limit": "^10.3.0",
+    "@fastify/static": "^8.2.0",
+    "@fontsource/golos-text": "^5.2.8",
+    "@tanstack/react-query": "^5.90.0",
+    "big-integer": "^1.6.52",
+    "dotenv": "^17.2.0",
+    "fastify": "^5.6.0",
+    "lucide-react": "^0.468.0",
+    "mongodb": "^7.8.0",
+    "openai": "^6.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.0",
+    "teleproto": "^1.233.0",
+    "web-push": "^3.6.7",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/web-push": "^3.6.4",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.2.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0",
+    "vite-plugin-pwa": "^1.1.0",
+    "vitest": "^3.2.0",
+    "workbox-core": "^7.3.0",
+    "workbox-precaching": "^7.3.0",
+    "workbox-routing": "^7.3.0"
+  }
+}
