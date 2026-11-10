@@ -59,6 +59,7 @@ import {
   type Stage,
   type Feedback,
   type AccountChannel,
+  type Job,
 } from "../shared/model";
 import { registerSW } from "virtual:pwa-register";
 
@@ -206,7 +207,9 @@ export default function App() {
     queryKey: ["state"],
     queryFn: () => api<AppData>("/state"),
     enabled: auth.data?.authenticated === true,
-    refetchInterval: 15000,
+    refetchInterval: (query) => query.state.data?.jobs.some(
+      (j: Job) => j.kind === "collect" && ["pending", "running"].includes(j.status),
+    ) ? 3000 : 15000,
     retry: false,
   });
   useEffect(() => {
@@ -584,11 +587,9 @@ function Feed({ data, refresh, notify }: Common) {
         <div className="collection-inline running">
           <LoaderCircle size={16} />
           <span>
-            {data.jobs.some(
-              (j) => j.kind === "collect" && j.status === "running",
-            )
-              ? "Идёт сбор каналов"
-              : "Сбор в очереди"}
+            {collectionLabel(data.jobs.find(
+              (j) => j.kind === "collect" && ["pending", "running"].includes(j.status),
+            )!)}
           </span>
           <button className="text-link" onClick={() => setCollectionOpen(true)}>
             Состояние
@@ -773,8 +774,22 @@ function CollectionModal({
     (j) => j.kind === "collect" && ["pending", "running"].includes(j.status),
   );
   const latest = data.jobs
-    .filter((j) => j.kind === "collect" && j.window?.mode === "manual")
+    .filter((j) => j.kind === "collect")
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  async function cancel() {
+    if (!active) return;
+    setCancellingId(active.id);
+    setError("");
+    try {
+      await api(`/collect/${encodeURIComponent(active.id)}/cancel`, "POST", {});
+      await refresh();
+      notify("Отмена запрошена. Сохранённые результаты останутся.");
+    } catch (e) {
+      setError((e as Error).message);
+      setCancellingId(null);
+    }
+  }
   async function start(resumeJobId?: string) {
     setBusy(true);
     setError("");
@@ -848,19 +863,14 @@ function CollectionModal({
       </form>
       {(active || latest) && (
         <div className="collection-status">
-          <h3>{active ? "Текущий запуск" : "Последний ручной запуск"}</h3>
-          <p>
-            {(active || latest)?.status === "pending"
-              ? "В очереди"
-              : (active || latest)?.status === "running"
-                ? "Обрабатываются сообщения"
-                : latest?.incomplete
-                  ? "Сбор не завершён полностью"
-                  : "Сбор завершён"}
-          </p>
+          <h3>{active ? "Текущий запуск" : "Последний запуск"}</h3>
+          <CollectionProgress job={(active || latest)!} />
+          {active && <button className="secondary full-width" disabled={cancellingId === active.id} onClick={() => void cancel()}>
+            {cancellingId === active.id ? "Останавливаем сбор…" : "Отменить сбор"}
+          </button>}
           <p>Период: {(active || latest)?.window?.lookbackDays || 1} дн.</p>
           {latest?.error && !active && <p>{latest.error}</p>}
-          {latest?.incomplete && !active && (
+          {latest?.incomplete && latest.window?.mode === "manual" && !active && (
             <button
               className="text-link"
               disabled={busy}
@@ -873,6 +883,54 @@ function CollectionModal({
       )}
     </Modal>
   );
+}
+
+function collectionLabel(job: Job) {
+  if (job.cancelledBy === "user") return "Сбор отменён пользователем";
+  if (job.status === "pending") return "В очереди — ожидаем worker";
+  const p = job.progress;
+  if (!p) return job.status === "running" ? "Сбор сообщений" : job.incomplete ? "Сбор не завершён полностью" : "Сбор завершён";
+  switch (p.phase) {
+    case "telegram": return `Telegram: источник ${Math.min(p.sourcesDone + 1, p.sourcesTotal)} из ${p.sourcesTotal}${p.sourceName ? ` · ${p.sourceName}` : ""}`;
+    case "extract": return `ИИ: разбор сообщения ${Math.min(p.messagesDone + 1, p.messagesTotal)} из ${p.messagesTotal}`;
+    case "evaluate": return `ИИ: проверка соответствия анкете · сообщение ${Math.min(p.messagesDone + 1, p.messagesTotal)} из ${p.messagesTotal}`;
+    case "recheck": return `Обновление подбора: ${p.rechecked} из ${p.recheckTotal}`;
+    case "summary": return "ИИ: составление сводки";
+    case "cancelled": return "Сбор остановлен по таймауту";
+    case "failed": return "Не удалось завершить сбор";
+    case "done": return job.incomplete ? "Сбор завершён частично" : "Сбор завершён";
+  }
+}
+function CollectionProgress({ job }: { job: Job }) {
+  const [now, setNow] = useState(Date.now());
+  const running = job.status === "running";
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+  const p = job.progress;
+  const elapsed = p ? Math.max(0, Math.floor(((running ? now : Date.parse(job.updatedAt)) - Date.parse(p.startedAt)) / 1000)) : 0;
+  const duration = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
+  return <div className="collection-progress" aria-live="polite">
+    <p className="collection-phase">{collectionLabel(job)}</p>
+    {p && <>
+      {running && <progress aria-label={p.phase === "telegram" ? "Проверено источников" : "Обработано сообщений"}
+        max={p.phase === "telegram" ? Math.max(p.sourcesTotal, 1) : Math.max(p.messagesTotal, 1)}
+        value={p.phase === "telegram" ? p.sourcesDone : p.messagesDone} />}
+      <dl>
+        <div><dt>Источники проверены</dt><dd>{p.sourcesDone} / {p.sourcesTotal}</dd></div>
+        <div><dt>Сообщения прочитаны</dt><dd>{p.messagesRead}</dd></div>
+        <div><dt>Сообщения обработаны ИИ</dt><dd>{p.messagesDone} / {p.messagesTotal || "—"}</dd></div>
+        <div><dt>Запросы к ИИ</dt><dd>{p.aiCalls}</dd></div>
+        <div><dt>Новые подходящие предложения</dt><dd>{p.offersAdded}</dd></div>
+        <div><dt>Время сбора</dt><dd>{duration}</dd></div>
+      </dl>
+      {p.sourceName && p.phase !== "telegram" && <p>Источник: {p.sourceName}</p>}
+    </>}
+    {running && <p>Остановка через 10 минут от старта или после 90 секунд ожидания ответа. Результаты сохраняются.</p>}
+    {job.status === "pending" && <p>Если сбор не начинается, проверь, что контейнер worker запущен.</p>}
+  </div>;
 }
 
 function OfferCard({
@@ -2227,6 +2285,20 @@ function Connections({ data, refresh, notify }: Common) {
       setBusy(false);
     }
   }
+  const [testingTelegram, setTestingTelegram] = useState(false);
+  const [telegramTest, setTelegramTest] = useState<{ ok: boolean; text: string } | null>(null);
+  async function testTelegram() {
+    setTestingTelegram(true);
+    setTelegramTest(null);
+    try {
+      const result = await api<{ latencyMs: number; proxy: boolean; authorized: boolean }>("/telegram/test", "POST", {});
+      setTelegramTest({ ok: true, text: `Telegram отвечает ${result.proxy ? "через MTProto-прокси" : "напрямую"} · ${(result.latencyMs / 1000).toFixed(1)} с.${result.authorized ? " Сессия работает." : " Можно подключить аккаунт."}` });
+    } catch (e) {
+      setTelegramTest({ ok: false, text: (e as Error).message });
+    } finally {
+      setTestingTelegram(false);
+    }
+  }
   async function testAI() {
     setBusy(true);
     try {
@@ -2261,6 +2333,12 @@ function Connections({ data, refresh, notify }: Common) {
             {data.telegram.connected ? "Подключён" : "Не подключён"}
           </span>
         </div>
+        {data.telegram.configured && <>
+          <button className="secondary" disabled={testingTelegram || busy || (!!flow && !["connected", "error"].includes(flow.status))} onClick={() => void testTelegram()}>
+            {testingTelegram ? "Проверяем соединение…" : "Проверить соединение"}
+          </button>
+          {telegramTest && <p className={telegramTest.ok ? "helper" : "error"} role="status">{telegramTest.text}</p>}
+        </>}
         {!data.telegram.configured ? (
           <div className="notice">
             <Info size={18} />

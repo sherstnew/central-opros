@@ -4,6 +4,7 @@ import {
   runCollection,
   collectionWindow,
   enqueueCollection,
+  cancelCollection,
 } from "../server/pipeline";
 import { config } from "../server/config";
 import {
@@ -87,6 +88,7 @@ beforeEach(async () => {
     "feedback",
     "digest",
     "job",
+    "control",
     "profile",
   ] as const) {
     for (const record of await store.list<{ id: string }>(table))
@@ -112,6 +114,32 @@ beforeEach(async () => {
   });
 });
 describe("Восстановление сбора и пользовательские действия", () => {
+  it("отменяет сбор до запуска worker", async () => {
+    const queued = await enqueueCollection(moscowDay(), { manual: true });
+    await cancelCollection(queued.id);
+    expect(await runCollection(queued)).toBe(false);
+    expect(mock.extract).not.toHaveBeenCalled();
+    expect((await store.get<Job>("job", queued.id))?.cancelledBy).toBe("user");
+  });
+  it("прерывает ожидающий запрос ИИ при отмене и сохраняет исходные сообщения", async () => {
+    vi.useFakeTimers();
+    try {
+      let started!: () => void;
+      const entered = new Promise<void>((resolve) => { started = resolve; });
+      mock.extract.mockImplementation(() => { started(); return new Promise(() => {}); });
+      const queued = await enqueueCollection(moscowDay(), { manual: true });
+      const running = runCollection(queued);
+      await entered;
+      await cancelCollection(queued.id);
+      await vi.advanceTimersByTimeAsync(1000);
+      await running;
+      const saved = await store.get<Job>("job", queued.id);
+      expect(saved?.cancelledBy).toBe("user");
+      expect(saved?.status).toBe("failed");
+      expect((await store.list<RawMessage>("message"))[0].processedHash).toBeUndefined();
+      expect(mock.evaluate).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
   it("не отправляет старые необработанные сообщения в ИИ при ночном сборе", async () => {
     await store.put<RawMessage>("message", "one:old", {
       id: "one:old",

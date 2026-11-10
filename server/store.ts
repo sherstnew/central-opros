@@ -10,6 +10,7 @@ type Table =
   | "feedback"
   | "digest"
   | "job"
+  | "control"
   | "subscription"
   | "secret"
   | "session";

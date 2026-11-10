@@ -1527,6 +1527,21 @@ label small {
 .collection-status .text-link {
   margin-top: 9px;
 }
+.collection-progress .collection-phase {
+  color: var(--text);
+  font-weight: 500;
+}
+.collection-progress progress {
+  display: block;
+  width: 100%;
+  height: 5px;
+  margin: 14px 0;
+  accent-color: #315bad;
+}
+.collection-progress dl { margin: 14px 0; font-size: 12px; }
+.collection-progress dl div { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; }
+.collection-progress dt { color: var(--muted); }
+.collection-progress dd { margin: 0; font-variant-numeric: tabular-nums; }
 .collection-inline {
   display: flex;
   gap: 8px;

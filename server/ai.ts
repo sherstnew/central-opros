@@ -27,6 +27,7 @@ async function structured<T>(
   name: string,
   system: string,
   data: unknown,
+  signal?: AbortSignal,
 ) {
   if (!config.aiKey || !config.aiModel)
     throw new Error("Настрой PROXYAPI_KEY и AI_MODEL на сервере");
@@ -48,23 +49,25 @@ async function structured<T>(
       },
     },
     max_completion_tokens: 3000,
-  });
+  }, { signal });
   const content = response.choices[0]?.message.content;
   if (!content) throw new Error("Модель не вернула структурированный ответ");
   return schema.parse(JSON.parse(content));
 }
-export async function extract(text: string, date: string) {
+export async function extract(text: string, date: string, signal?: AbortSignal) {
   return structured(
     z.object({ surveys: z.array(extractedSchema).max(15) }),
     "surveys",
     `Выдели все самостоятельные платные исследования из объявления. Реклама, бесплатные анкеты, вакансии и розыгрыши: пустой массив surveys. Неизвестные значения — null; для неизвестной валюты — пустая строка. startsAt и deadline — ISO8601 с часовым поясом только если дата однозначна; относительные даты вычисляй от publishedAt, часовой пояс по умолчанию Europe/Moscow. Если вариантов времени несколько, startsAt=null, перечисли в dateLabel. dedupKey: стабильная подпись темы, организатора, даты и требований. Ссылки бери только из текста.`,
     { text, publishedAt: date },
+    signal,
   );
 }
 export async function evaluate(
   offer: Extracted,
   profile: Profile,
   feedback: Feedback[],
+  signal?: AbortSignal,
 ) {
   return structured(
     matchSchema,
@@ -76,6 +79,7 @@ export async function evaluate(
       feedback: feedbackContext(feedback),
       today: new Date().toISOString(),
     },
+    signal,
   );
 }
 export async function validateAI() {
@@ -86,7 +90,7 @@ export async function validateAI() {
     { test: true },
   );
 }
-export async function summarize(offers: Offer[]) {
+export async function summarize(offers: Offer[], signal?: AbortSignal) {
   return structured(
     z.object({ summary: z.string().max(1000) }),
     "daily_digest",
@@ -101,5 +105,6 @@ export async function summarize(offers: Offer[]) {
         match,
         questions,
       })),
+    signal,
   );
 }

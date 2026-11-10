@@ -1,4 +1,4 @@
-import { TelegramClient } from "teleproto";
+import { Api, TelegramClient } from "teleproto";
 import { StringSession } from "teleproto/sessions";
 import { randomUUID } from "node:crypto";
 import { config } from "./config";
@@ -34,12 +34,46 @@ export async function telegramConnected() {
   );
   return !!session && !session.invalid;
 }
-export async function telegramClient() {
+export async function testTelegramConnection() {
+  if (!config.telegramId || !config.telegramHash)
+    throw new Error("На сервере не заданы TELEGRAM_API_ID и TELEGRAM_API_HASH");
+  const secret = await store.get<{ value: string }>("secret", "telegram");
+  const client = newClient(secret ? decrypt(secret.value) : "");
+  const started = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        await client.connect();
+        if (secret) await client.getMe();
+        else await client.invoke(new Api.help.GetConfig());
+      })(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("timeout")), 15_000);
+      }),
+    ]);
+    return { ok: true, latencyMs: Date.now() - started, proxy: !!config.telegramProxyUrl, authorized: !!secret };
+  } catch (error) {
+    if (/SESSION_REVOKED|AUTH_KEY_UNREGISTERED|SESSION_EXPIRED/.test(String(error)))
+      throw new Error("Сессия Telegram истекла. Подключи аккаунт заново.");
+    throw new Error(config.telegramProxyUrl
+      ? "Telegram не ответил: проверь MTProto-прокси, его доступность с сервера и TELEGRAM_API_ID / TELEGRAM_API_HASH. Лимит проверки — 15 секунд."
+      : "Telegram не ответил: проверь доступ с сервера и TELEGRAM_API_ID / TELEGRAM_API_HASH. Лимит проверки — 15 секунд.");
+  } finally {
+    clearTimeout(timer);
+    void client.disconnect().catch(() => {});
+  }
+}
+export async function telegramClient(signal?: AbortSignal) {
   const secret = await store.get<{ value: string }>("secret", "telegram");
   if (!secret) throw new Error("Подключи Telegram в настройках");
   const client = newClient(decrypt(secret.value));
+  const abort = () => { void client.disconnect().catch(() => {}); };
+  signal?.addEventListener("abort", abort, { once: true });
   try {
+    signal?.throwIfAborted();
     await client.connect();
+    signal?.throwIfAborted();
     if (!(await client.checkAuthorization())) {
       await store.put("secret", "telegram", { ...secret, invalid: true });
       throw new Error("Сессия Telegram истекла. Подключи аккаунт заново");
@@ -54,6 +88,8 @@ export async function telegramClient() {
     )
       await store.put("secret", "telegram", { ...secret, invalid: true });
     throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
   }
 }
 export async function startTelegram(phone: string) {

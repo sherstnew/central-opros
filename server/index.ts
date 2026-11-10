@@ -17,8 +17,9 @@ import {
   telegramFlow,
   submitTelegram,
   disconnectTelegram,
+  testTelegramConnection,
 } from "./telegram";
-import { enqueueCollection } from "./pipeline";
+import { enqueueCollection, cancelCollection } from "./pipeline";
 import { validateAI } from "./ai";
 import { pushConfigured } from "./notifications";
 import { listAccountChannels, addAccountChannels } from "./channels";
@@ -315,6 +316,12 @@ export async function createServer() {
       };
     return enqueueCollection(moscowDay(), { manual: true, ...input });
   });
+  app.post<{ Params: { id: string } }>("/api/collect/:id/cancel", async (req) => {
+    return cancelCollection(z.string().min(1).max(100).parse(req.params.id));
+  });
+  app.post("/api/telegram/test", {
+    config: { rateLimit: { max: 3, timeWindow: "1 minute" } },
+  }, async () => testTelegramConnection());
   app.post(
     "/api/ai/test",
     { config: { rateLimit: { max: 3, timeWindow: "1 minute" } } },

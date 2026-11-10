@@ -151,6 +151,22 @@ export interface Job {
   };
   sourceCursors?: Record<string, { offsetId: number; done: boolean }>;
   incomplete?: boolean;
+  cancelledBy?: "user" | "timeout";
+  progress?: {
+    phase: "telegram" | "extract" | "evaluate" | "recheck" | "summary" | "done" | "failed" | "cancelled";
+    startedAt: string;
+    deadlineAt: string;
+    sourceName?: string;
+    sourcesDone: number;
+    sourcesTotal: number;
+    messagesRead: number;
+    messagesDone: number;
+    messagesTotal: number;
+    aiCalls: number;
+    offersAdded: number;
+    rechecked: number;
+    recheckTotal: number;
+  };
 }
 export const collectionInputSchema = z.object({
   lookbackDays: z.number().int().min(1).max(30).default(1),

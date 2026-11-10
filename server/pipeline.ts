@@ -5,6 +5,7 @@ import { extract, evaluate, summarize } from "./ai";
 import { hardMismatch, dedupCandidate } from "./matching";
 import { telegramClient } from "./telegram";
 import { sourceEntity, sourceMessageUrl } from "./channels";
+import { CollectionControl, COLLECTION_TIMEOUT_MS } from "./collection-control";
 import {
   moscowDay,
   profileSchema,
@@ -17,6 +18,19 @@ import {
   type Job,
 } from "../shared/model";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+const cancellationKey = (id: string) => `cancel:${id}`;
+export async function cancelCollection(id: string) {
+  const job = await store.get<Job>("job", id);
+  if (!job || job.kind !== "collect") throw new Error("Сбор не найден");
+  if (!["pending", "running"].includes(job.status)) return { ok: true };
+  await store.put("control", cancellationKey(id), { requestedAt: new Date().toISOString() });
+  if (job.status === "pending")
+    await store.put("job", id, {
+      ...job, status: "failed", cancelledBy: "user", incomplete: true,
+      error: "Сбор отменён пользователем", updatedAt: new Date().toISOString(),
+    });
+  return { ok: true };
+}
 export function collectionWindow(
   lookbackDays = 1,
   now = new Date(),
@@ -56,8 +70,10 @@ export async function enqueueCollection(
       status: "pending",
       attempts: 0,
       error: undefined,
+      cancelledBy: undefined,
       updatedAt: new Date().toISOString(),
     };
+    await store.remove("control", cancellationKey(next.id));
     await store.put("job", next.id, next);
     return next;
   }
@@ -86,28 +102,37 @@ export async function enqueueCollection(
     ),
     sourceCursors: {},
   };
+  await store.remove("control", cancellationKey(id));
   await store.put("job", id, next);
   return next;
 }
-async function collectSource(source: Source, job: Job) {
+async function collectSource(source: Source, job: Job, control: CollectionControl, report: (force?: boolean) => Promise<void>) {
   const cursor = job.sourceCursors?.[source.id];
   if (cursor?.done) return;
-  const client = await telegramClient();
+  const client = await control.wait(telegramClient(control.signal), "Telegram");
+  const abort = () => { void client.disconnect().catch(() => {}); };
+  control.signal.addEventListener("abort", abort, { once: true });
   try {
     const window = job.window!;
     const since = Date.parse(window.since),
       until = Date.parse(window.until);
-    const entity = await sourceEntity(client, source);
+    const entity = await control.wait(sourceEntity(client, source), "Telegram");
     let oldest = cursor?.offsetId || 0,
       top = source.lastMessageId,
       count = 0,
       complete = false;
-    for await (const message of client.iterMessages(entity, {
+    const iterator = client.iterMessages(entity, {
       limit: config.maxMessages,
       offsetId: cursor?.offsetId || 0,
       offsetDate: Math.floor(until / 1000) + 1,
-    })) {
+    })[Symbol.asyncIterator]();
+    while (true) {
+      const next = await control.wait(iterator.next(), "Telegram");
+      if (next.done) break;
+      const message = next.value;
       count++;
+      job.progress!.messagesRead++;
+      await report();
       oldest = message.id;
       const published = message.date * 1000;
       if (published < since) {
@@ -153,15 +178,48 @@ async function collectSource(source: Source, job: Job) {
     if (!complete)
       throw new Error("Достигнут лимит сообщений; продолжение сохранено");
   } finally {
-    await client.disconnect();
+    control.signal.removeEventListener("abort", abort);
+    void client.disconnect().catch(() => {});
   }
 }
 export async function runCollection(job: Job) {
   const release = await store.lock("collection");
   if (!release) return false;
+  const currentJob = await store.get<Job>("job", job.id);
+  if (currentJob?.cancelledBy === "user" && !["pending", "running"].includes(currentJob.status)) {
+    await release();
+    return false;
+  }
+  const control = new CollectionControl();
+  let cancelledByUser = false;
+  const checkCancellation = async () => {
+    if (await store.get("control", cancellationKey(job.id))) {
+      cancelledByUser = true;
+      control.stop("Сбор отменён пользователем");
+    }
+  };
+  const cancellationPoll = setInterval(() => {
+    void checkCancellation().catch(() => {});
+  }, 1000);
   const now = new Date().toISOString();
   job.window ??= collectionWindow();
   job.sourceCursors ??= {};
+  job.status = "running";
+  job.progress = {
+    phase: "telegram", startedAt: now,
+    deadlineAt: new Date(Date.now() + COLLECTION_TIMEOUT_MS).toISOString(),
+    sourcesDone: 0, sourcesTotal: 0, messagesRead: 0,
+    messagesDone: 0, messagesTotal: 0, aiCalls: 0, offersAdded: 0,
+    rechecked: 0, recheckTotal: 0,
+  };
+  let lastReport = 0;
+  const report = async (force = false) => {
+    control.check();
+    if (!force && Date.now() - lastReport < 2000) return;
+    job.updatedAt = new Date().toISOString();
+    await store.put("job", job.id, job);
+    lastReport = Date.now();
+  };
   const digestId = job.window.mode === "manual" ? job.id : job.day;
   let digest = await store.get<Digest>("digest", digestId);
   digest = {
@@ -187,15 +245,22 @@ export async function runCollection(job: Job) {
     processed = 0,
     added = 0;
   try {
+    await checkCancellation();
+    control.check();
     const sources = (await store.list<Source>("source")).filter(
       (s) => s.enabled,
     );
+    job.progress.sourcesTotal = sources.length;
     if (!sources.length)
       throw new Error("Добавь хотя бы один Telegram-канал в настройках");
     for (const source of sources) {
+      control.check();
+      job.progress.sourceName = source.name;
+      await report(true);
       try {
-        await collectSource(source, job);
+        await collectSource(source, job, control, report);
       } catch {
+        control.check();
         errors.push(
           `${source.name}: сбор не завершён. Проверь доступ к каналу и состояние Telegram.`,
         );
@@ -207,6 +272,8 @@ export async function runCollection(job: Job) {
               "Не удалось завершить сбор. Проверь подключение или повтори позже.",
           });
       }
+      job.progress.sourcesDone++;
+      await report(true);
     }
     const profile =
         (await store.get<Profile>("profile", "owner")) ||
@@ -225,7 +292,10 @@ export async function runCollection(job: Job) {
           m.date <= job.window!.until,
       )
       .sort((a, b) => a.date.localeCompare(b.date));
+    job.progress.sourceName = undefined;
+    job.progress.messagesTotal = messages.length;
     for (const message of messages) {
+      control.check();
       if (calls >= config.maxCalls) {
         errors.push(
           "Лимит запросов ИИ достигнут. Необработанные сообщения сохранены.",
@@ -234,10 +304,15 @@ export async function runCollection(job: Job) {
       }
       try {
         calls++;
-        const { surveys } = await extract(
+        job.progress.phase = "extract";
+        job.progress.aiCalls = calls;
+        job.progress.sourceName = sources.find((s) => s.id === message.sourceId)?.name;
+        await report(true);
+        const { surveys } = await control.wait(extract(
           message.text.slice(0, 18000),
           message.date,
-        );
+          control.signal,
+        ), "ИИ");
         if (calls + surveys.length > config.maxCalls) {
           errors.push(
             "Лимит запросов ИИ достигнут. Продолжи обработку повторным запуском.",
@@ -245,8 +320,12 @@ export async function runCollection(job: Job) {
           break;
         }
         for (const item of surveys) {
+          control.check();
           if (!item.isSurvey) continue;
           calls++;
+          job.progress.phase = "evaluate";
+          job.progress.aiCalls = calls;
+          await report(true);
           const mismatch = hardMismatch(item, profile),
             assessment = mismatch
               ? {
@@ -255,7 +334,7 @@ export async function runCollection(job: Job) {
                   questions: [],
                   score: 0,
                 }
-              : await evaluate(item, profile, feedback);
+              : await control.wait(evaluate(item, profile, feedback, control.signal), "ИИ");
           const offers = await store.list<Offer>("offer");
           const fromMessage = offers.filter((o) =>
             o.sources.some((s) => s.messageId === message.id),
@@ -314,13 +393,17 @@ export async function runCollection(job: Job) {
             await unlock();
           }
           if (!existing && offer.match !== "no") added++;
+          job.progress.offersAdded = added;
         }
         await store.put("message", message.id, {
           ...message,
           processedHash: message.hash,
         });
         processed++;
+        job.progress.messagesDone = processed;
+        await report(true);
       } catch {
+        control.check();
         errors.push(
           "Не удалось обработать часть сообщений через ИИ. Они сохранены для повторного запуска.",
         );
@@ -331,7 +414,10 @@ export async function runCollection(job: Job) {
     const stale = (await store.list<Offer>("offer"))
       .filter((o) => o.stage === "new" && o.matchVersion !== revision)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    job.progress.recheckTotal = stale.length;
+    job.progress.sourceName = undefined;
     for (const offer of stale) {
+      control.check();
       if (calls >= config.maxCalls) {
         errors.push(
           "Персонализация обновлена частично: достигнут лимит запросов.",
@@ -341,6 +427,9 @@ export async function runCollection(job: Job) {
       try {
         const mismatch = hardMismatch(offer, profile);
         calls++;
+        job.progress.phase = "recheck";
+        job.progress.aiCalls = calls;
+        await report(true);
         const result = mismatch
           ? {
               match: "no" as const,
@@ -348,7 +437,7 @@ export async function runCollection(job: Job) {
               questions: [],
               score: 0,
             }
-          : await evaluate(offer, profile, feedback);
+          : await control.wait(evaluate(offer, profile, feedback, control.signal), "ИИ");
         const unlock = await store.lock(`offer:${offer.id}`, 30);
         if (!unlock) continue;
         try {
@@ -362,7 +451,10 @@ export async function runCollection(job: Job) {
         } finally {
           await unlock();
         }
+        job.progress.rechecked++;
+        await report(true);
       } catch {
+        control.check();
         errors.push(
           "Часть предложений не удалось повторно оценить. Повторим при следующем сборе.",
         );
@@ -377,9 +469,13 @@ export async function runCollection(job: Job) {
       : "Новых подходящих опросов нет.";
     if (visible.length && calls < config.maxCalls) {
       calls++;
+      job.progress.phase = "summary";
+      job.progress.aiCalls = calls;
+      await report(true);
       try {
-        summary = (await summarize(visible)).summary;
+        summary = (await control.wait(summarize(visible, control.signal), "ИИ")).summary;
       } catch {
+        control.check();
         errors.push(
           "Не удалось составить краткую сводку. Сами предложения доступны.",
         );
@@ -390,6 +486,8 @@ export async function runCollection(job: Job) {
         ? "partial"
         : "failed"
       : "complete";
+    control.check();
+    job.progress.phase = state === "failed" ? "failed" : "done";
     await store.put("digest", digestId, {
       ...digest,
       status: state,
@@ -407,6 +505,8 @@ export async function runCollection(job: Job) {
       updatedAt: new Date().toISOString(),
     });
   } catch (error) {
+    job.progress.phase = control.signal.aborted ? "cancelled" : "failed";
+    job.cancelledBy = control.signal.aborted ? (cancelledByUser ? "user" : "timeout") : undefined;
     await store.put("digest", digestId, {
       ...digest,
       status: "failed",
@@ -423,6 +523,8 @@ export async function runCollection(job: Job) {
       updatedAt: new Date().toISOString(),
     });
   } finally {
+    clearInterval(cancellationPoll);
+    control.close();
     await release();
   }
   return { added };
