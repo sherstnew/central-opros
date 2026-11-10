@@ -16,6 +16,7 @@ export const config = {
   maxMessages: Number(process.env.MAX_MESSAGES_PER_SOURCE || 500),
   telegramId: Number(process.env.TELEGRAM_API_ID || 0),
   telegramHash: process.env.TELEGRAM_API_HASH || "",
+  telegramProxyUrl: process.env.TELEGRAM_PROXY_URL || "",
   vapidPublic: process.env.VAPID_PUBLIC_KEY || "",
   vapidPrivate: process.env.VAPID_PRIVATE_KEY || "",
   vapidSubject: process.env.VAPID_SUBJECT || process.env.APP_ORIGIN || "",

@@ -2,6 +2,7 @@ import { TelegramClient } from "teleproto";
 import { StringSession } from "teleproto/sessions";
 import { randomUUID } from "node:crypto";
 import { config } from "./config";
+import { telegramProxy } from "./telegram-proxy";
 import { store } from "./store";
 import { encrypt, decrypt } from "./security";
 interface Flow {
@@ -18,7 +19,12 @@ function newClient(session = "") {
     new StringSession(session),
     config.telegramId,
     config.telegramHash,
-    { connectionRetries: 2, requestRetries: 2, floodSleepThreshold: 0 },
+    {
+      connectionRetries: 2,
+      requestRetries: 2,
+      floodSleepThreshold: 0,
+      transport: telegramProxy(config.telegramProxyUrl),
+    },
   );
 }
 export async function telegramConnected() {

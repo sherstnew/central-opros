@@ -70,6 +70,16 @@ npm run setup
 
 Документация Dokploy: [Environment для Compose](https://docs.dokploy.com/docs/core/docker-compose), [Domains для Compose](https://docs.dokploy.com/docs/core/docker-compose/domains).
 
+### MTProto-прокси для Telegram
+
+При необходимости добавь в `.env` (в Dokploy — в Environment) одну переменную со ссылкой своего прокси целиком:
+
+```env
+TELEGRAM_PROXY_URL="tg://proxy?server=proxy.example.com&port=443&secret=ТВОЙ_SECRET"
+```
+
+Также принимается ссылка `https://t.me/proxy?server=…&port=…&secret=…`. После изменения перезапусти приложение и worker; в Dokploy выполни Deploy. Прокси применяется к входу в Telegram, загрузке списка чатов и всему ручному/ночному сбору. Пустое значение означает прямое соединение. Существующую Telegram-сессию переподключать не требуется. Поддерживаются обычные, `dd` и `ee` (fake TLS) секреты библиотеки teleproto. Если заданный прокси недоступен, автоматического переключения на прямое соединение нет. MongoDB и ProxyAPI используют собственные прямые соединения.
+
 ## Как работает подбор
 
 - По умолчанию сбор в 03:00, уведомление в 08:00, часовой пояс Europe/Moscow; время меняется в интерфейсе.
