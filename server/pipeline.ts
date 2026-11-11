@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { store } from "./store";
 import { config } from "./config";
-import { extract, evaluate, summarize } from "./ai";
-import { hardMismatch, dedupCandidate } from "./matching";
+import { analyze, evaluate, summarize, findDuplicates } from "./ai";
+import { hardMismatch, dedupCandidate, duplicateCandidates } from "./matching";
+import { mergeDuplicates } from "./dedup";
 import { telegramClient } from "./telegram";
 import { sourceEntity, sourceMessageUrl } from "./channels";
 import { CollectionControl, COLLECTION_TIMEOUT_MS } from "./collection-control";
@@ -23,11 +24,17 @@ export async function cancelCollection(id: string) {
   const job = await store.get<Job>("job", id);
   if (!job || job.kind !== "collect") throw new Error("Сбор не найден");
   if (!["pending", "running"].includes(job.status)) return { ok: true };
-  await store.put("control", cancellationKey(id), { requestedAt: new Date().toISOString() });
+  await store.put("control", cancellationKey(id), {
+    requestedAt: new Date().toISOString(),
+  });
   if (job.status === "pending")
     await store.put("job", id, {
-      ...job, status: "failed", cancelledBy: "user", incomplete: true,
-      error: "Сбор отменён пользователем", updatedAt: new Date().toISOString(),
+      ...job,
+      status: "failed",
+      cancelledBy: "user",
+      incomplete: true,
+      error: "Сбор отменён пользователем",
+      updatedAt: new Date().toISOString(),
     });
   return { ok: true };
 }
@@ -106,11 +113,18 @@ export async function enqueueCollection(
   await store.put("job", id, next);
   return next;
 }
-async function collectSource(source: Source, job: Job, control: CollectionControl, report: (force?: boolean) => Promise<void>) {
+async function collectSource(
+  source: Source,
+  job: Job,
+  control: CollectionControl,
+  report: (force?: boolean) => Promise<void>,
+) {
   const cursor = job.sourceCursors?.[source.id];
   if (cursor?.done) return;
   const client = await control.wait(telegramClient(control.signal), "Telegram");
-  const abort = () => { void client.disconnect().catch(() => {}); };
+  const abort = () => {
+    void client.disconnect().catch(() => {});
+  };
   control.signal.addEventListener("abort", abort, { once: true });
   try {
     const window = job.window!;
@@ -121,11 +135,13 @@ async function collectSource(source: Source, job: Job, control: CollectionContro
       top = source.lastMessageId,
       count = 0,
       complete = false;
-    const iterator = client.iterMessages(entity, {
-      limit: config.maxMessages,
-      offsetId: cursor?.offsetId || 0,
-      offsetDate: Math.floor(until / 1000) + 1,
-    })[Symbol.asyncIterator]();
+    const iterator = client
+      .iterMessages(entity, {
+        limit: config.maxMessages,
+        offsetId: cursor?.offsetId || 0,
+        offsetDate: Math.floor(until / 1000) + 1,
+      })
+      [Symbol.asyncIterator]();
     while (true) {
       const next = await control.wait(iterator.next(), "Telegram");
       if (next.done) break;
@@ -186,7 +202,10 @@ export async function runCollection(job: Job) {
   const release = await store.lock("collection");
   if (!release) return false;
   const currentJob = await store.get<Job>("job", job.id);
-  if (currentJob?.cancelledBy === "user" && !["pending", "running"].includes(currentJob.status)) {
+  if (
+    currentJob?.cancelledBy === "user" &&
+    !["pending", "running"].includes(currentJob.status)
+  ) {
     await release();
     return false;
   }
@@ -206,11 +225,18 @@ export async function runCollection(job: Job) {
   job.sourceCursors ??= {};
   job.status = "running";
   job.progress = {
-    phase: "telegram", startedAt: now,
+    phase: "telegram",
+    startedAt: now,
     deadlineAt: new Date(Date.now() + COLLECTION_TIMEOUT_MS).toISOString(),
-    sourcesDone: 0, sourcesTotal: 0, messagesRead: 0,
-    messagesDone: 0, messagesTotal: 0, aiCalls: 0, offersAdded: 0,
-    rechecked: 0, recheckTotal: 0,
+    sourcesDone: 0,
+    sourcesTotal: 0,
+    messagesRead: 0,
+    messagesDone: 0,
+    messagesTotal: 0,
+    aiCalls: 0,
+    offersAdded: 0,
+    rechecked: 0,
+    recheckTotal: 0,
   };
   let lastReport = 0;
   const report = async (force = false) => {
@@ -306,26 +332,30 @@ export async function runCollection(job: Job) {
         calls++;
         job.progress.phase = "extract";
         job.progress.aiCalls = calls;
-        job.progress.sourceName = sources.find((s) => s.id === message.sourceId)?.name;
+        job.progress.sourceName = sources.find(
+          (s) => s.id === message.sourceId,
+        )?.name;
         await report(true);
-        const { surveys } = await control.wait(extract(
-          message.text.slice(0, 18000),
-          message.date,
-          control.signal,
-        ), "ИИ");
-        if (calls + surveys.length > config.maxCalls) {
-          errors.push(
-            "Лимит запросов ИИ достигнут. Продолжи обработку повторным запуском.",
-          );
-          break;
-        }
-        for (const item of surveys) {
+        const candidates = duplicateCandidates(
+          message.text,
+          await store.list<Offer>("offer"),
+        );
+        const { surveys } = await control.wait(
+          analyze(
+            message.text.slice(0, 18000),
+            message.date,
+            profile,
+            feedback,
+            candidates,
+            control.signal,
+          ),
+          "ИИ",
+        );
+        for (const analyzed of surveys) {
+          const { duplicateId, match, reasons, questions, score, ...item } =
+            analyzed;
           control.check();
           if (!item.isSurvey) continue;
-          calls++;
-          job.progress.phase = "evaluate";
-          job.progress.aiCalls = calls;
-          await report(true);
           const mismatch = hardMismatch(item, profile),
             assessment = mismatch
               ? {
@@ -334,8 +364,10 @@ export async function runCollection(job: Job) {
                   questions: [],
                   score: 0,
                 }
-              : await control.wait(evaluate(item, profile, feedback, control.signal), "ИИ");
-          const offers = await store.list<Offer>("offer");
+              : { match, reasons, questions, score };
+          const offers = (await store.list<Offer>("offer")).filter(
+            (o) => !o.duplicateOf,
+          );
           const fromMessage = offers.filter((o) =>
             o.sources.some((s) => s.messageId === message.id),
           );
@@ -346,7 +378,10 @@ export async function runCollection(job: Job) {
             (surveys.length === 1 && fromMessage.length === 1
               ? fromMessage[0]
               : undefined) ||
-            offers.find((o) => dedupCandidate(item, o));
+            offers.find((o) => dedupCandidate(item, o)) ||
+            (candidates.some((o) => o.id === duplicateId)
+              ? offers.find((o) => o.id === duplicateId)
+              : undefined);
           const source = sources.find((s) => s.id === message.sourceId)!;
           const reference = {
             messageId: message.id,
@@ -412,7 +447,10 @@ export async function runCollection(job: Job) {
     }
     // A changed profile or deleted rejection must also affect already extracted offers.
     const stale = (await store.list<Offer>("offer"))
-      .filter((o) => o.stage === "new" && o.matchVersion !== revision)
+      .filter(
+        (o) =>
+          !o.duplicateOf && o.stage === "new" && o.matchVersion !== revision,
+      )
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     job.progress.recheckTotal = stale.length;
     job.progress.sourceName = undefined;
@@ -437,7 +475,10 @@ export async function runCollection(job: Job) {
               questions: [],
               score: 0,
             }
-          : await control.wait(evaluate(offer, profile, feedback, control.signal), "ИИ");
+          : await control.wait(
+              evaluate(offer, profile, feedback, control.signal),
+              "ИИ",
+            );
         const unlock = await store.lock(`offer:${offer.id}`, 30);
         if (!unlock) continue;
         try {
@@ -461,8 +502,55 @@ export async function runCollection(job: Job) {
         break;
       }
     }
+    // One-time semantic cleanup of accumulated offers, resumable within the call budget.
+    const unchecked = (await store.list<Offer>("offer"))
+      .filter((o) => !o.duplicateOf)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    for (const offer of unchecked) {
+      if (calls >= config.maxCalls) break;
+      const marker = `dedup:v1:${offer.id}`;
+      if (await store.get("control", marker)) continue;
+      const candidates = duplicateCandidates(
+        `${offer.title} ${offer.summary} ${offer.organizer} ${offer.applyUrl}`,
+        unchecked.filter((o) => o.id !== offer.id),
+        39,
+      );
+      if (!candidates.length) continue;
+      calls++;
+      job.progress.phase = "evaluate";
+      job.progress.aiCalls = calls;
+      await report(true);
+      try {
+        const batch = [offer, ...candidates];
+        const { groups } = await control.wait(
+          findDuplicates(batch, control.signal),
+          "ИИ",
+        );
+        const allowed = new Set(batch.map((o) => o.id));
+        const seen = new Set<string>();
+        for (const group of groups) {
+          if (
+            new Set(group).size !== group.length ||
+            group.some((id) => !allowed.has(id) || seen.has(id))
+          )
+            throw new Error("Некорректные группы повторов");
+          group.forEach((id) => seen.add(id));
+        }
+        for (const group of groups) await mergeDuplicates(group);
+        for (const checked of batch)
+          await store.put("control", `dedup:v1:${checked.id}`, {
+            checkedAt: new Date().toISOString(),
+          });
+      } catch {
+        control.check();
+        errors.push(
+          "Не удалось проверить накопленные повторы. Повторим при следующем сборе.",
+        );
+        break;
+      }
+    }
     const visible = (await store.list<Offer>("offer")).filter(
-      (o) => o.day === job.day && o.match !== "no",
+      (o) => !o.duplicateOf && o.day === job.day && o.match !== "no",
     );
     let summary = visible.length
       ? `Найдено предложений: ${visible.length}. Открой карточки, чтобы выбрать интересное.`
@@ -473,7 +561,8 @@ export async function runCollection(job: Job) {
       job.progress.aiCalls = calls;
       await report(true);
       try {
-        summary = (await control.wait(summarize(visible, control.signal), "ИИ")).summary;
+        summary = (await control.wait(summarize(visible, control.signal), "ИИ"))
+          .summary;
       } catch {
         control.check();
         errors.push(
@@ -506,7 +595,11 @@ export async function runCollection(job: Job) {
     });
   } catch (error) {
     job.progress.phase = control.signal.aborted ? "cancelled" : "failed";
-    job.cancelledBy = control.signal.aborted ? (cancelledByUser ? "user" : "timeout") : undefined;
+    job.cancelledBy = control.signal.aborted
+      ? cancelledByUser
+        ? "user"
+        : "timeout"
+      : undefined;
     await store.put("digest", digestId, {
       ...digest,
       status: "failed",

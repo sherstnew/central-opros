@@ -7,6 +7,7 @@ import {
 } from "../server/matching";
 import {
   profileSchema,
+  feedbackSchema,
   extractedSchema,
   type Offer,
   type Feedback,
@@ -71,6 +72,25 @@ describe("Подбор по подтверждённым фактам", () => {
     ).toBeNull());
 });
 describe("Повторные публикации", () => {
+  it("не передаёт разовую занятость в предпочтения ИИ", () => {
+    expect(
+      feedbackContext([
+        {
+          scope: "timing",
+          reason: "Сегодня не успеваю",
+          permanent: false,
+        } as Feedback,
+      ]),
+    ).toEqual([]);
+    expect(
+      feedbackSchema.safeParse({
+        offerId: "1",
+        scope: "timing",
+        permanent: true,
+        rule: "Никогда",
+      }).success,
+    ).toBe(false);
+  });
   it("объединяет одинаковые условия, а не просто одинаковую ссылку", () => {
     const previous = { ...extracted } as Offer;
     expect(dedupCandidate(extracted, previous)).toBe(true);

@@ -169,7 +169,7 @@ export async function createServer() {
     settings:
       (await store.get<Settings>("profile", "settings")) ||
       settingsSchema.parse({}),
-    offers: await store.list<Offer>("offer"),
+    offers: (await store.list<Offer>("offer")).filter((o) => !o.duplicateOf),
     sources: await store.list<Source>("source"),
     feedback: await store.list<Feedback>("feedback"),
     digests: await store.list<Digest>("digest"),
@@ -253,6 +253,8 @@ export async function createServer() {
       throw new Error("Укажи условие исключения");
     const f = await store.get<Feedback>("feedback", req.params.id);
     if (!f) throw new Error("Причина не найдена");
+    if (f.scope === "timing" && patch.permanent)
+      throw new Error("Разовая занятость не может быть постоянным запретом");
     await store.put("feedback", f.id, { ...f, ...patch });
     await store.put("profile", "revision", { value: randomUUID() });
     return { ok: true };

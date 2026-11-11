@@ -19,6 +19,7 @@ const mock = vi.hoisted(() => ({
   text: "Первое объявление",
   extract: vi.fn(),
   evaluate: vi.fn(),
+  duplicates: vi.fn(),
   messages: [] as { id: number; date: number; message: string }[],
 }));
 vi.mock("../server/telegram", () => ({
@@ -48,7 +49,20 @@ vi.mock("../server/ai", () => ({
   summarize: async () => ({
     summary: "Подходят интервью о банковских приложениях.",
   }),
-  extract: (...args: any[]) => mock.extract(...args),
+  analyze: async (...args: any[]) => {
+    const result = await mock.extract(...args);
+    return {
+      surveys: result.surveys.map((item: any) => ({
+        match: "yes",
+        reasons: ["Подходит"],
+        questions: [],
+        score: 80,
+        duplicateId: null,
+        ...item,
+      })),
+    };
+  },
+  findDuplicates: (...args: any[]) => mock.duplicates(...args),
   evaluate: (...args: any[]) => mock.evaluate(...args),
 }));
 const item = extractedSchema.parse({
@@ -103,6 +117,7 @@ beforeEach(async () => {
     lastMessageId: 0,
   });
   mock.text = "Первое объявление";
+  mock.duplicates.mockReset().mockResolvedValue({ groups: [] });
   mock.messages = [];
   await store.remove("profile", "revision");
   mock.extract.mockReset().mockResolvedValue({ surveys: [item] });
@@ -114,6 +129,98 @@ beforeEach(async () => {
   });
 });
 describe("Восстановление сбора и пользовательские действия", () => {
+  it("обрабатывает несколько опросов одним вызовом при лимите в один запрос", async () => {
+    const previousLimit = config.maxCalls;
+    config.maxCalls = 1;
+    try {
+      mock.extract.mockResolvedValue({ surveys: [item, { ...item, title: "Другое исследование", dedupKey: "another-study", applyUrl: null }] });
+      await runCollection(job());
+      expect(await store.list("offer")).toHaveLength(2);
+      expect(mock.extract).toHaveBeenCalledTimes(1);
+      expect(mock.evaluate).not.toHaveBeenCalled();
+      expect(mock.duplicates).not.toHaveBeenCalled();
+    } finally { config.maxCalls = previousLimit; }
+  });
+  it("не объединяет две отдельные истории участия", async () => {
+    await runCollection(job());
+    const original = (await store.list<Offer>("offer"))[0];
+    await store.put("offer", original.id, { ...original, stage: "paid" });
+    await store.put("offer", "second", { ...original, id: "second", stage: "booked" });
+    mock.duplicates.mockResolvedValue({ groups: [[original.id, "second"]] });
+    await runCollection(job());
+    expect((await store.list<Offer>("offer")).filter((o) => !o.duplicateOf)).toHaveLength(2);
+  });
+  it("не скрывает карточки при некорректной группе повторов от ИИ", async () => {
+    await runCollection(job());
+    const original = (await store.list<Offer>("offer"))[0];
+    await store.put("offer", "second", { ...original, id: "second" });
+    mock.duplicates.mockResolvedValue({ groups: [[original.id, "second"], ["invented", original.id]] });
+    await runCollection(job());
+    expect((await store.list<Offer>("offer")).every((o) => !o.duplicateOf)).toBe(true);
+  });
+  it("передаёт полную анкету и отказы в общий запрос без отдельной оценки", async () => {
+    const profile = profileSchema.parse({
+      about: "Есть ребёнок",
+      profession: "Дизайнер",
+    });
+    await store.put("profile", "owner", profile);
+    await runCollection(job());
+    expect(mock.extract.mock.calls[0][2]).toEqual(profile);
+    expect(mock.evaluate).not.toHaveBeenCalled();
+  });
+  it("объединяет семантический повтор с другим названием, сохраняя скрытие", async () => {
+    await runCollection(job());
+    const previous = (await store.list<Offer>("offer"))[0];
+    await store.put("offer", previous.id, {
+      ...previous,
+      stage: "hidden",
+      note: "Не подходит",
+    });
+    mock.text = "Иначе сформулированное объявление";
+    mock.extract.mockResolvedValue({
+      surveys: [
+        {
+          ...item,
+          title: "Новое название",
+          dedupKey: "different",
+          duplicateId: previous.id,
+        },
+      ],
+    });
+    await runCollection(job());
+    expect(await store.list("offer")).toHaveLength(1);
+    expect(await store.get("offer", previous.id)).toMatchObject({
+      stage: "hidden",
+      note: "Не подходит",
+    });
+  });
+  it("не принимает выдуманный моделью id повтора", async () => {
+    mock.extract.mockResolvedValue({
+      surveys: [{ ...item, duplicateId: "invented" }],
+    });
+    await runCollection(job());
+    expect((await store.list<Offer>("offer"))[0].id).not.toBe("invented");
+  });
+  it("очищает накопленные повторы, сохраняя статус и источники", async () => {
+    await runCollection(job());
+    const original = (await store.list<Offer>("offer"))[0];
+    await store.put("offer", "old-copy", {
+      ...original,
+      id: "old-copy",
+      title: "Другая формулировка",
+      stage: "saved",
+      note: "Моя заметка",
+    });
+    mock.duplicates.mockResolvedValue({ groups: [[original.id, "old-copy"]] });
+    await runCollection(job());
+    expect(await store.get("offer", original.id)).toMatchObject({
+      duplicateOf: "old-copy",
+    });
+    expect(await store.get("offer", "old-copy")).toMatchObject({
+      stage: "saved",
+      note: "Моя заметка",
+    });
+  });
   it("отменяет сбор до запуска worker", async () => {
     const queued = await enqueueCollection(moscowDay(), { manual: true });
     await cancelCollection(queued.id);
@@ -125,8 +232,13 @@ describe("Восстановление сбора и пользовательс�
     vi.useFakeTimers();
     try {
       let started!: () => void;
-      const entered = new Promise<void>((resolve) => { started = resolve; });
-      mock.extract.mockImplementation(() => { started(); return new Promise(() => {}); });
+      const entered = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      mock.extract.mockImplementation(() => {
+        started();
+        return new Promise(() => {});
+      });
       const queued = await enqueueCollection(moscowDay(), { manual: true });
       const running = runCollection(queued);
       await entered;
@@ -136,9 +248,13 @@ describe("Восстановление сбора и пользовательс�
       const saved = await store.get<Job>("job", queued.id);
       expect(saved?.cancelledBy).toBe("user");
       expect(saved?.status).toBe("failed");
-      expect((await store.list<RawMessage>("message"))[0].processedHash).toBeUndefined();
+      expect(
+        (await store.list<RawMessage>("message"))[0].processedHash,
+      ).toBeUndefined();
       expect(mock.evaluate).not.toHaveBeenCalled();
-    } finally { vi.useRealTimers(); }
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("не отправляет старые необработанные сообщения в ИИ при ночном сборе", async () => {
     await store.put<RawMessage>("message", "one:old", {

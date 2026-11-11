@@ -1336,16 +1336,54 @@ label small {
   padding-top: 14px;
   color: #8a96a6;
 }
+.offer-list {
+  overflow-x: clip;
+}
+.offer-card.offer-accepted,
+.offer-card.offer-rejected {
+  position: relative;
+  pointer-events: none;
+  animation: offer-depart 280ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+.offer-accepted {
+  --departure-x: 105%;
+}
+.offer-rejected {
+  --departure-x: -105%;
+}
+.departure-label {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: #ffffffed;
+  color: #295ce6;
+  font-size: 20px;
+  font-weight: 600;
+}
+.offer-rejected .departure-label {
+  color: #707783;
+}
+@keyframes offer-depart {
+  to {
+    transform: translateX(var(--departure-x));
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .offer-card.offer-accepted,
+  .offer-card.offer-rejected {
+    animation: none;
+  }
+}
 .toast {
-  position: fixed;
-  z-index: 150;
-  left: calc(50% + 90px);
-  bottom: 26px;
-  transform: translateX(-50%);
+  position: relative;
+  margin: 12px auto 0;
   display: flex;
   align-items: center;
   gap: 10px;
-  max-width: min(650px, 90vw);
+  width: calc(100% - 48px);
+  max-width: 920px;
   padding: 14px 16px;
   border: 1px solid #354352;
   border-radius: 8px;
@@ -1359,6 +1397,11 @@ label small {
 .toast > svg {
   color: #a6b8d2;
   width: 18px;
+}
+.toast > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .toast button {
   border: 0;
@@ -1538,10 +1581,23 @@ label small {
   margin: 14px 0;
   accent-color: #315bad;
 }
-.collection-progress dl { margin: 14px 0; font-size: 12px; }
-.collection-progress dl div { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; }
-.collection-progress dt { color: var(--muted); }
-.collection-progress dd { margin: 0; font-variant-numeric: tabular-nums; }
+.collection-progress dl {
+  margin: 14px 0;
+  font-size: 12px;
+}
+.collection-progress dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 5px 0;
+}
+.collection-progress dt {
+  color: var(--muted);
+}
+.collection-progress dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
 .collection-inline {
   display: flex;
   gap: 8px;
@@ -1912,8 +1968,6 @@ label small {
     font-weight: 400;
   }
   .toast {
-    left: 50%;
-    bottom: calc(86px + env(safe-area-inset-bottom));
     width: calc(100% - 28px);
     max-width: 620px;
     font-size: 11px;

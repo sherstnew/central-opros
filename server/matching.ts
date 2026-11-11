@@ -62,9 +62,28 @@ export function dedupCandidate(a: Extracted, b: Offer) {
     a.title.toLowerCase() === b.title.toLowerCase()
   );
 }
+// Bound repeated context while prioritizing related studies across channels and days.
+export function duplicateCandidates(text: string, offers: Offer[], limit = 20) {
+  const words = new Set(
+    text.toLocaleLowerCase("ru").match(/[\p{L}\p{N}]{4,}/gu) || [],
+  );
+  const rank = (o: Offer) =>
+    (o.title + " " + o.summary + " " + o.organizer + " " + o.applyUrl)
+      .toLocaleLowerCase("ru")
+      .match(/[\p{L}\p{N}]{4,}/gu)
+      ?.reduce((n, w) => n + Number(words.has(w)), 0) || 0;
+  return offers
+    .filter((o) => !o.duplicateOf)
+    .map((o) => ({ o, rank: rank(o) }))
+    .sort(
+      (a, b) => b.rank - a.rank || b.o.updatedAt.localeCompare(a.o.updatedAt),
+    )
+    .slice(0, limit)
+    .map(({ o }) => o);
+}
 export function feedbackContext(feedback: Feedback[]) {
   return feedback
-    .filter((x) => x.reason || x.permanent)
+    .filter((x) => x.scope !== "timing" && (x.reason || x.permanent))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     .slice(0, 60)
     .map(({ reason, permanent, rule, title, category, createdAt }) => ({

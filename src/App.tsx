@@ -207,9 +207,13 @@ export default function App() {
     queryKey: ["state"],
     queryFn: () => api<AppData>("/state"),
     enabled: auth.data?.authenticated === true,
-    refetchInterval: (query) => query.state.data?.jobs.some(
-      (j: Job) => j.kind === "collect" && ["pending", "running"].includes(j.status),
-    ) ? 3000 : 15000,
+    refetchInterval: (query) =>
+      query.state.data?.jobs.some(
+        (j: Job) =>
+          j.kind === "collect" && ["pending", "running"].includes(j.status),
+      )
+        ? 3000
+        : 15000,
     retry: false,
   });
   useEffect(() => {
@@ -392,6 +396,29 @@ export default function App() {
             <button onClick={() => state.refetch()}>Повторить</button>
           </div>
         )}
+        {toast && (
+          <div className="toast" role="status">
+            <I icon={CheckCircle2} size={20} />
+            <span>{toast.text}</span>
+            {toast.action && (
+              <button
+                onClick={() => {
+                  toast.action?.();
+                  setToast(null);
+                }}
+              >
+                {toast.label}
+              </button>
+            )}
+            <button
+              className="toast-close"
+              onClick={() => setToast(null)}
+              aria-label="Закрыть сообщение"
+            >
+              <I icon={X} size={16} />
+            </button>
+          </div>
+        )}
         <Routes>
           <Route
             path="/"
@@ -441,29 +468,6 @@ export default function App() {
           </NavLink>
         ))}
       </nav>
-      {toast && (
-        <div className="toast" role="status">
-          <I icon={CheckCircle2} size={20} />
-          <span>{toast.text}</span>
-          {toast.action && (
-            <button
-              onClick={() => {
-                toast.action?.();
-                setToast(null);
-              }}
-            >
-              {toast.label}
-            </button>
-          )}
-          <button
-            className="toast-close"
-            onClick={() => setToast(null)}
-            aria-label="Закрыть сообщение"
-          >
-            <I icon={X} size={16} />
-          </button>
-        </div>
-      )}
     </div>
   );
 }
@@ -519,6 +523,20 @@ function Login({ onLogin }: { onLogin: () => void }) {
 
 type Common = { data: AppData; refresh: () => Promise<void>; notify: Notify };
 function Feed({ data, refresh, notify }: Common) {
+  const [departure, setDeparture] = useState<{
+    offer: Offer;
+    direction: "accepted" | "rejected";
+  } | null>(null);
+  async function depart(offer: Offer, direction: "accepted" | "rejected") {
+    setDeparture({ offer, direction });
+    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches)
+      await new Promise((resolve) => setTimeout(resolve, 280));
+    try {
+      await refresh();
+    } finally {
+      setDeparture(null);
+    }
+  }
   const [collectionOpen, setCollectionOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [params, setParams] = useSearchParams(),
@@ -531,7 +549,10 @@ function Feed({ data, refresh, notify }: Common) {
     digest = data.digests
       .filter((d) => d.day === day)
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0],
-    all = data.offers
+    all = [
+      ...data.offers.filter((o) => o.id !== departure?.offer.id),
+      ...(departure ? [departure.offer] : []),
+    ]
       .filter((o) => o.stage === "new" && o.match !== "no" && o.day === day)
       .sort((a, b) => b.score - a.score);
   const offers = all.filter(
@@ -552,7 +573,7 @@ function Feed({ data, refresh, notify }: Common) {
     setBusy(true);
     try {
       await api(`/offers/${offer.id}`, "PATCH", { stage: "saved" });
-      await refresh();
+      await depart(offer, "accepted");
       notify("Предложение в работе", () => {
         void api(`/offers/${offer.id}`, "PATCH", { stage: "new" })
           .then(refresh)
@@ -587,9 +608,13 @@ function Feed({ data, refresh, notify }: Common) {
         <div className="collection-inline running">
           <LoaderCircle size={16} />
           <span>
-            {collectionLabel(data.jobs.find(
-              (j) => j.kind === "collect" && ["pending", "running"].includes(j.status),
-            )!)}
+            {collectionLabel(
+              data.jobs.find(
+                (j) =>
+                  j.kind === "collect" &&
+                  ["pending", "running"].includes(j.status),
+              )!,
+            )}
           </span>
           <button className="text-link" onClick={() => setCollectionOpen(true)}>
             Состояние
@@ -707,6 +732,9 @@ function Feed({ data, refresh, notify }: Common) {
                 onReject={() => setReject(o)}
                 onDetails={() => setDetails(o)}
                 disabled={busy}
+                departure={
+                  departure?.offer.id === o.id ? departure.direction : undefined
+                }
               />
             ))}
             {!offers.length && (
@@ -746,6 +774,16 @@ function Feed({ data, refresh, notify }: Common) {
           onClose={() => setReject(null)}
           refresh={refresh}
           notify={notify}
+          onRejected={async () => {
+            const offer = reject;
+            setReject(null);
+            setBusy(true);
+            try {
+              await depart(offer, "rejected");
+            } finally {
+              setBusy(false);
+            }
+          }}
         />
       )}
       {details && <Details offer={details} onClose={() => setDetails(null)} />}
@@ -865,20 +903,30 @@ function CollectionModal({
         <div className="collection-status">
           <h3>{active ? "Текущий запуск" : "Последний запуск"}</h3>
           <CollectionProgress job={(active || latest)!} />
-          {active && <button className="secondary full-width" disabled={cancellingId === active.id} onClick={() => void cancel()}>
-            {cancellingId === active.id ? "Останавливаем сбор…" : "Отменить сбор"}
-          </button>}
-          <p>Период: {(active || latest)?.window?.lookbackDays || 1} дн.</p>
-          {latest?.error && !active && <p>{latest.error}</p>}
-          {latest?.incomplete && latest.window?.mode === "manual" && !active && (
+          {active && (
             <button
-              className="text-link"
-              disabled={busy}
-              onClick={() => start(latest.id)}
+              className="secondary full-width"
+              disabled={cancellingId === active.id}
+              onClick={() => void cancel()}
             >
-              Продолжить незавершённый сбор
+              {cancellingId === active.id
+                ? "Останавливаем сбор…"
+                : "Отменить сбор"}
             </button>
           )}
+          <p>Период: {(active || latest)?.window?.lookbackDays || 1} дн.</p>
+          {latest?.error && !active && <p>{latest.error}</p>}
+          {latest?.incomplete &&
+            latest.window?.mode === "manual" &&
+            !active && (
+              <button
+                className="text-link"
+                disabled={busy}
+                onClick={() => start(latest.id)}
+              >
+                Продолжить незавершённый сбор
+              </button>
+            )}
         </div>
       )}
     </Modal>
@@ -889,16 +937,29 @@ function collectionLabel(job: Job) {
   if (job.cancelledBy === "user") return "Сбор отменён пользователем";
   if (job.status === "pending") return "В очереди — ожидаем worker";
   const p = job.progress;
-  if (!p) return job.status === "running" ? "Сбор сообщений" : job.incomplete ? "Сбор не завершён полностью" : "Сбор завершён";
+  if (!p)
+    return job.status === "running"
+      ? "Сбор сообщений"
+      : job.incomplete
+        ? "Сбор не завершён полностью"
+        : "Сбор завершён";
   switch (p.phase) {
-    case "telegram": return `Telegram: источник ${Math.min(p.sourcesDone + 1, p.sourcesTotal)} из ${p.sourcesTotal}${p.sourceName ? ` · ${p.sourceName}` : ""}`;
-    case "extract": return `ИИ: разбор сообщения ${Math.min(p.messagesDone + 1, p.messagesTotal)} из ${p.messagesTotal}`;
-    case "evaluate": return `ИИ: проверка соответствия анкете · сообщение ${Math.min(p.messagesDone + 1, p.messagesTotal)} из ${p.messagesTotal}`;
-    case "recheck": return `Обновление подбора: ${p.rechecked} из ${p.recheckTotal}`;
-    case "summary": return "ИИ: составление сводки";
-    case "cancelled": return "Сбор остановлен по таймауту";
-    case "failed": return "Не удалось завершить сбор";
-    case "done": return job.incomplete ? "Сбор завершён частично" : "Сбор завершён";
+    case "telegram":
+      return `Telegram: источник ${Math.min(p.sourcesDone + 1, p.sourcesTotal)} из ${p.sourcesTotal}${p.sourceName ? ` · ${p.sourceName}` : ""}`;
+    case "extract":
+      return `ИИ: разбор сообщения ${Math.min(p.messagesDone + 1, p.messagesTotal)} из ${p.messagesTotal}`;
+    case "evaluate":
+      return `ИИ: проверка соответствия анкете · сообщение ${Math.min(p.messagesDone + 1, p.messagesTotal)} из ${p.messagesTotal}`;
+    case "recheck":
+      return `Обновление подбора: ${p.rechecked} из ${p.recheckTotal}`;
+    case "summary":
+      return "ИИ: составление сводки";
+    case "cancelled":
+      return "Сбор остановлен по таймауту";
+    case "failed":
+      return "Не удалось завершить сбор";
+    case "done":
+      return job.incomplete ? "Сбор завершён частично" : "Сбор завершён";
   }
 }
 function CollectionProgress({ job }: { job: Job }) {
@@ -910,27 +971,83 @@ function CollectionProgress({ job }: { job: Job }) {
     return () => clearInterval(timer);
   }, [running]);
   const p = job.progress;
-  const elapsed = p ? Math.max(0, Math.floor(((running ? now : Date.parse(job.updatedAt)) - Date.parse(p.startedAt)) / 1000)) : 0;
+  const elapsed = p
+    ? Math.max(
+        0,
+        Math.floor(
+          ((running ? now : Date.parse(job.updatedAt)) -
+            Date.parse(p.startedAt)) /
+            1000,
+        ),
+      )
+    : 0;
   const duration = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
-  return <div className="collection-progress" aria-live="polite">
-    <p className="collection-phase">{collectionLabel(job)}</p>
-    {p && <>
-      {running && <progress aria-label={p.phase === "telegram" ? "Проверено источников" : "Обработано сообщений"}
-        max={p.phase === "telegram" ? Math.max(p.sourcesTotal, 1) : Math.max(p.messagesTotal, 1)}
-        value={p.phase === "telegram" ? p.sourcesDone : p.messagesDone} />}
-      <dl>
-        <div><dt>Источники проверены</dt><dd>{p.sourcesDone} / {p.sourcesTotal}</dd></div>
-        <div><dt>Сообщения прочитаны</dt><dd>{p.messagesRead}</dd></div>
-        <div><dt>Сообщения обработаны ИИ</dt><dd>{p.messagesDone} / {p.messagesTotal || "—"}</dd></div>
-        <div><dt>Запросы к ИИ</dt><dd>{p.aiCalls}</dd></div>
-        <div><dt>Новые подходящие предложения</dt><dd>{p.offersAdded}</dd></div>
-        <div><dt>Время сбора</dt><dd>{duration}</dd></div>
-      </dl>
-      {p.sourceName && p.phase !== "telegram" && <p>Источник: {p.sourceName}</p>}
-    </>}
-    {running && <p>Остановка через 10 минут от старта или после 90 секунд ожидания ответа. Результаты сохраняются.</p>}
-    {job.status === "pending" && <p>Если сбор не начинается, проверь, что контейнер worker запущен.</p>}
-  </div>;
+  return (
+    <div className="collection-progress" aria-live="polite">
+      <p className="collection-phase">{collectionLabel(job)}</p>
+      {p && (
+        <>
+          {running && (
+            <progress
+              aria-label={
+                p.phase === "telegram"
+                  ? "Проверено источников"
+                  : "Обработано сообщений"
+              }
+              max={
+                p.phase === "telegram"
+                  ? Math.max(p.sourcesTotal, 1)
+                  : Math.max(p.messagesTotal, 1)
+              }
+              value={p.phase === "telegram" ? p.sourcesDone : p.messagesDone}
+            />
+          )}
+          <dl>
+            <div>
+              <dt>Источники проверены</dt>
+              <dd>
+                {p.sourcesDone} / {p.sourcesTotal}
+              </dd>
+            </div>
+            <div>
+              <dt>Сообщения прочитаны</dt>
+              <dd>{p.messagesRead}</dd>
+            </div>
+            <div>
+              <dt>Сообщения обработаны ИИ</dt>
+              <dd>
+                {p.messagesDone} / {p.messagesTotal || "—"}
+              </dd>
+            </div>
+            <div>
+              <dt>Запросы к ИИ</dt>
+              <dd>{p.aiCalls}</dd>
+            </div>
+            <div>
+              <dt>Новые подходящие предложения</dt>
+              <dd>{p.offersAdded}</dd>
+            </div>
+            <div>
+              <dt>Время сбора</dt>
+              <dd>{duration}</dd>
+            </div>
+          </dl>
+          {p.sourceName && p.phase !== "telegram" && (
+            <p>Источник: {p.sourceName}</p>
+          )}
+        </>
+      )}
+      {running && (
+        <p>
+          Остановка через 10 минут от старта или после 90 секунд ожидания
+          ответа. Результаты сохраняются.
+        </p>
+      )}
+      {job.status === "pending" && (
+        <p>Если сбор не начинается, проверь, что контейнер worker запущен.</p>
+      )}
+    </div>
+  );
 }
 
 function OfferCard({
@@ -939,6 +1056,7 @@ function OfferCard({
   onReject,
   onDetails,
   disabled = false,
+  departure,
   children,
 }: {
   offer: Offer;
@@ -946,10 +1064,19 @@ function OfferCard({
   onReject?: () => void;
   onDetails: () => void;
   disabled?: boolean;
+  departure?: "accepted" | "rejected";
   children?: ReactNode;
 }) {
   return (
-    <article className="offer-card">
+    <article
+      className={`offer-card${departure ? ` offer-${departure}` : ""}`}
+      aria-busy={!!departure}
+    >
+      {departure && (
+        <span className="departure-label" role="status">
+          {departure === "accepted" ? "В работе" : "Скрыто"}
+        </span>
+      )}
       <div className="offer-top">
         <span className="category-name">{o.category || "Исследование"}</span>
         <span
@@ -1039,13 +1166,16 @@ function RejectModal({
   onClose,
   refresh,
   notify,
+  onRejected,
 }: {
   offer: Offer;
   onClose: () => void;
   refresh: () => Promise<void>;
   notify: Notify;
+  onRejected?: () => Promise<void>;
 }) {
   const [reason, setReason] = useState(""),
+    [timing, setTiming] = useState(false),
     [permanent, setPermanent] = useState(false),
     [rule, setRule] = useState(""),
     [busy, setBusy] = useState(false),
@@ -1059,9 +1189,13 @@ function RejectModal({
         reason,
         permanent,
         rule,
+        scope: timing ? "timing" : "preference",
       });
-      await refresh();
-      onClose();
+      if (onRejected) await onRejected();
+      else {
+        await refresh();
+        onClose();
+      }
       notify("Предложение скрыто", () => {
         void (async () => {
           await api(`/feedback/${result.id}`, "DELETE");
@@ -1086,13 +1220,23 @@ function RejectModal({
             "Мало платят",
             "Неинтересная тема",
             "Не могу в это время",
+            "Сегодня не успеваю",
             "Не подхожу по условиям",
             "Не хочу очно",
           ].map((r) => (
             <button
               type="button"
               key={r}
-              onClick={() => setReason(r)}
+              onClick={() => {
+                setReason(r);
+                const once =
+                  r === "Сегодня не успеваю" || r === "Не могу в это время";
+                setTiming(once);
+                if (once) {
+                  setPermanent(false);
+                  setRule("");
+                }
+              }}
               className={reason === r ? "selected" : ""}
             >
               {r}
@@ -1105,14 +1249,23 @@ function RejectModal({
             rows={3}
             maxLength={1500}
             value={reason}
-            onChange={(e) => setReason(e.target.value)}
+            onChange={(e) => {
+              setReason(e.target.value);
+              setTiming(false);
+            }}
             placeholder="Или напиши своими словами…"
           />
         </label>
+        {timing && (
+          <p className="helper">
+            Разовый отказ: не повлияет на подбор других опросов.
+          </p>
+        )}
         <label className="checkbox-label">
           <input
             type="checkbox"
             checked={permanent}
+            disabled={timing}
             onChange={(e) => setPermanent(e.target.checked)}
           />
           <span>Больше не показывать по этому условию</span>
@@ -2286,13 +2439,23 @@ function Connections({ data, refresh, notify }: Common) {
     }
   }
   const [testingTelegram, setTestingTelegram] = useState(false);
-  const [telegramTest, setTelegramTest] = useState<{ ok: boolean; text: string } | null>(null);
+  const [telegramTest, setTelegramTest] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
   async function testTelegram() {
     setTestingTelegram(true);
     setTelegramTest(null);
     try {
-      const result = await api<{ latencyMs: number; proxy: boolean; authorized: boolean }>("/telegram/test", "POST", {});
-      setTelegramTest({ ok: true, text: `Telegram отвечает ${result.proxy ? "через MTProto-прокси" : "напрямую"} · ${(result.latencyMs / 1000).toFixed(1)} с.${result.authorized ? " Сессия работает." : " Можно подключить аккаунт."}` });
+      const result = await api<{
+        latencyMs: number;
+        proxy: boolean;
+        authorized: boolean;
+      }>("/telegram/test", "POST", {});
+      setTelegramTest({
+        ok: true,
+        text: `Telegram отвечает ${result.proxy ? "через MTProto-прокси" : "напрямую"} · ${(result.latencyMs / 1000).toFixed(1)} с.${result.authorized ? " Сессия работает." : " Можно подключить аккаунт."}`,
+      });
     } catch (e) {
       setTelegramTest({ ok: false, text: (e as Error).message });
     } finally {
@@ -2333,12 +2496,28 @@ function Connections({ data, refresh, notify }: Common) {
             {data.telegram.connected ? "Подключён" : "Не подключён"}
           </span>
         </div>
-        {data.telegram.configured && <>
-          <button className="secondary" disabled={testingTelegram || busy || (!!flow && !["connected", "error"].includes(flow.status))} onClick={() => void testTelegram()}>
-            {testingTelegram ? "Проверяем соединение…" : "Проверить соединение"}
-          </button>
-          {telegramTest && <p className={telegramTest.ok ? "helper" : "error"} role="status">{telegramTest.text}</p>}
-        </>}
+        {data.telegram.configured && (
+          <>
+            <button
+              className="secondary"
+              disabled={
+                testingTelegram ||
+                busy ||
+                (!!flow && !["connected", "error"].includes(flow.status))
+              }
+              onClick={() => void testTelegram()}
+            >
+              {testingTelegram
+                ? "Проверяем соединение…"
+                : "Проверить соединение"}
+            </button>
+            {telegramTest && (
+              <p className={telegramTest.ok ? "helper" : "error"} role="status">
+                {telegramTest.text}
+              </p>
+            )}
+          </>
+        )}
         {!data.telegram.configured ? (
           <div className="notice">
             <Info size={18} />

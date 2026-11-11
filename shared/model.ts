@@ -112,6 +112,7 @@ export interface Offer extends Extracted {
   participationDate: string | null;
   actualReward: number | null;
   matchVersion?: string;
+  duplicateOf?: string;
 }
 export interface Feedback {
   id: string;
@@ -122,6 +123,7 @@ export interface Feedback {
   permanent: boolean;
   rule: string;
   createdAt: string;
+  scope?: "preference" | "timing";
 }
 export interface Digest {
   id: string;
@@ -153,7 +155,15 @@ export interface Job {
   incomplete?: boolean;
   cancelledBy?: "user" | "timeout";
   progress?: {
-    phase: "telegram" | "extract" | "evaluate" | "recheck" | "summary" | "done" | "failed" | "cancelled";
+    phase:
+      | "telegram"
+      | "extract"
+      | "evaluate"
+      | "recheck"
+      | "summary"
+      | "done"
+      | "failed"
+      | "cancelled";
     startedAt: string;
     deadlineAt: string;
     sourceName?: string;
@@ -206,9 +216,13 @@ export const feedbackSchema = z
     reason: z.string().max(1500).default(""),
     permanent: z.boolean().default(false),
     rule: z.string().max(300).default(""),
+    scope: z.enum(["preference", "timing"]).default("preference"),
   })
   .refine((v) => !v.permanent || v.rule.trim().length > 2, {
     message: "Укажи постоянное условие исключения",
+  })
+  .refine((v) => v.scope !== "timing" || !v.permanent, {
+    message: "Разовая занятость не может быть постоянным запретом",
   });
 export const sourceInputSchema = z.object({
   handle: z
