@@ -170,6 +170,11 @@ describe("Восстановление сбора и пользовательс�
     mock.duplicates.mockResolvedValue({ groups: [[original.id, "second"], ["invented", original.id]] });
     await runCollection(job());
     expect((await store.list<Offer>("offer")).every((o) => !o.duplicateOf)).toBe(true);
+    expect(await store.get("control", "dedup:last-error")).toMatchObject({
+      category: "groups", jobId: job().id, offerId: original.id,
+      candidateIds: ["second"],
+    });
+    expect(await store.get<Job>("job", job().id)).toMatchObject({status: "done", incomplete: true});
   });
   it("передаёт полную анкету и отказы в общий запрос без отдельной оценки", async () => {
     const profile = profileSchema.parse({

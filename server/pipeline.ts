@@ -4,6 +4,7 @@ import { config } from "./config";
 import { analyze, evaluate, summarize, findDuplicates } from "./ai";
 import { hardMismatch, dedupCandidate, duplicateCandidates, MATCHING_VERSION } from "./matching";
 import { mergeDuplicates } from "./dedup";
+import { duplicateError } from "./duplicate-error";
 import { telegramClient } from "./telegram";
 import { sourceEntity, sourceMessageUrl } from "./channels";
 import { CollectionControl, COLLECTION_TIMEOUT_MS } from "./collection-control";
@@ -540,10 +541,20 @@ export async function runCollection(job: Job) {
           await store.put("control", `dedup:v1:${checked.id}`, {
             checkedAt: new Date().toISOString(),
           });
-      } catch {
+      } catch (error) {
         control.check();
+        const diagnostic = {
+          ...duplicateError(error),
+          jobId: job.id,
+          offerId: offer.id,
+          candidateIds: candidates.map((o) => o.id),
+          at: new Date().toISOString(),
+        };
+        console.warn("Duplicate check failed", diagnostic);
+        // Failure to save diagnostics must not fail the completed message import.
+        await store.put("control", "dedup:last-error", diagnostic).catch(() => {});
         errors.push(
-          "Не удалось проверить накопленные повторы. Повторим при следующем сборе.",
+          `Не удалось проверить накопленные повторы. ${diagnostic.detail} Повторим при следующем сборе.`,
         );
         break;
       }
