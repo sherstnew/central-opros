@@ -9,6 +9,7 @@ import {
   type Offer,
 } from "../shared/model";
 import { feedbackContext } from "./matching";
+import { duplicateGroupsSchema } from "./duplicate-groups";
 const matchingInstructions = `Сопоставь все требования с полной анкетой, включая about, профессию, семью и пол. match=no только при явном несовпадении или нарушении permanent=true правила. Неизвестное — match=maybe с вопросами. Не делай вывод о конкретном несоответствии из общей причины «Не подхожу по условиям»: опирайся на анкету. permanent=false — мягкие предпочтения для score, не запреты. Разовые даты, занятость и «Сегодня не успеваю» не снижают оценки других исследований. minReward, maxDuration, format — предпочтения. Не меняй факты анкеты.`;
 const extractionInstructions = `Выдели все самостоятельные платные исследования из объявления. Реклама, бесплатные анкеты, вакансии и розыгрыши: пустой массив surveys. Неизвестное — null, неизвестная валюта — пустая строка. startsAt и deadline — ISO8601 с часовым поясом только при однозначной дате; относительные даты от publishedAt, часовой пояс Europe/Moscow. При нескольких вариантах времени startsAt=null, варианты в dateLabel. dedupKey — стабильная подпись темы, организатора, даты и требований. Ссылки только из текста. city — только название города, без метро и адреса; адрес и метро укажи в requirements. score — число от 0 до 100.`;
 const duplicateInstructions = `Повтор — то же конкретное исследование/набор, даже если заголовок, формулировки, сумма или источник различаются. Сравни тему, организатора, ссылку заявки, аудиторию, формат и даты в совокупности. Одна тема или общая ссылка организатора недостаточны. Разные волны набора, несовместимые даты, аудитории или организаторы — разные исследования. При сомнении не объединяй.`;
@@ -130,10 +131,11 @@ export async function analyze(
   );
 }
 export async function findDuplicates(offers: Offer[], signal?: AbortSignal) {
+  if (offers.length < 2) return { groups: [] };
   return structured(
-    z.object({ groups: z.array(z.array(z.string()).min(2).max(80)).max(40) }),
+    duplicateGroupsSchema(offers.map(o => o.id)),
     "duplicate_groups",
-    `${duplicateInstructions} Верни непересекающиеся группы id повторов. Каждый id только из offers.`,
+    `${duplicateInstructions} Верни непересекающиеся группы id повторов. Каждый id только из offers, скопируй его точно. Каждый id может встречаться во всём ответе максимум один раз, в том числе внутри группы. Если A, B и C — повторы, верни одну группу [A,B,C], а не пары [A,B] и [A,C]. Карточки без повторов не включай. Если повторов нет, groups=[].`,
     { offers: offers.map(compactOffer) },
     signal,
   );

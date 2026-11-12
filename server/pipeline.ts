@@ -5,6 +5,7 @@ import { analyze, evaluate, summarize, findDuplicates } from "./ai";
 import { hardMismatch, dedupCandidate, duplicateCandidates, MATCHING_VERSION } from "./matching";
 import { mergeDuplicates } from "./dedup";
 import { duplicateError } from "./duplicate-error";
+import { validateDuplicateGroups } from "./duplicate-groups";
 import { telegramClient } from "./telegram";
 import { sourceEntity, sourceMessageUrl } from "./channels";
 import { CollectionControl, COLLECTION_TIMEOUT_MS } from "./collection-control";
@@ -527,15 +528,7 @@ export async function runCollection(job: Job) {
           "ИИ",
         );
         const allowed = new Set(batch.map((o) => o.id));
-        const seen = new Set<string>();
-        for (const group of groups) {
-          if (
-            new Set(group).size !== group.length ||
-            group.some((id) => !allowed.has(id) || seen.has(id))
-          )
-            throw new Error("Некорректные группы повторов");
-          group.forEach((id) => seen.add(id));
-        }
+        validateDuplicateGroups(groups, allowed);
         for (const group of groups) await mergeDuplicates(group);
         for (const checked of batch)
           await store.put("control", `dedup:v1:${checked.id}`, {

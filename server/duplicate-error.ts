@@ -1,8 +1,18 @@
+import { DuplicateGroupsError } from "./duplicate-groups";
 // Persist categories only: provider errors may contain prompts or credentials.
 export function duplicateError(error: unknown) {
   const status = typeof (error as { status?: unknown })?.status === "number"
     ? (error as { status: number }).status : undefined;
   const name = error instanceof Error ? error.name : "";
+  if (error instanceof DuplicateGroupsError) {
+    const details = {
+      unknown_id: "ИИ указал ID вне переданного списка",
+      repeated_id: "ИИ повторил ID внутри одной группы",
+      overlapping_groups: "ИИ включил одну карточку в несколько групп",
+    };
+    return { category: "groups", violation: error.violation,
+      detail: `${details[error.violation]}; объединение отменено.`, status };
+  }
   if (status === 429) return { category: "rate_limit", detail: "ИИ ограничил число запросов (429).", status };
   if (status === 401 || status === 403)
     return { category: "access", detail: `ИИ отклонил доступ (${status}). Проверь ключ и доступ к модели.`, status };
