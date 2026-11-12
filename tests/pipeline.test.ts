@@ -100,6 +100,7 @@ beforeEach(async () => {
     "source",
     "message",
     "offer",
+    "catalog",
     "feedback",
     "digest",
     "job",
@@ -133,58 +134,131 @@ describe("Восстановление сбора и пользовательс�
   it("восстанавливает ошибочный отказ по метро после обновления правил, сохраняя ручные карточки", async () => {
     await runCollection(job());
     const original = (await store.list<Offer>("offer"))[0];
-    await store.put("profile", "owner", profileSchema.parse({city: "Москва"}));
-    await store.put("offer", original.id, { ...original, format: "offline", city: "Москва, метро «Марксистская»", match: "no", reasons: ["Другой город"], matchVersion: "initial" });
-    const manual: Offer = { ...original, id: "manual-test", manuallyAdded: true, title: "Ручной опрос", matchVersion: "initial", note: "Моя запись" };
+    await store.put(
+      "profile",
+      "owner",
+      profileSchema.parse({ city: "Москва" }),
+    );
+    await store.put("offer", original.id, {
+      ...original,
+      format: "offline",
+      city: "Москва, метро «Марксистская»",
+      match: "no",
+      reasons: ["Другой город"],
+      matchVersion: "initial",
+    });
+    const manual: Offer = {
+      ...original,
+      id: "manual-test",
+      manuallyAdded: true,
+      title: "Ручной опрос",
+      matchVersion: "initial",
+      note: "Моя запись",
+    };
     await store.put("offer", manual.id, manual);
     await runCollection(job());
-    expect(await store.get("offer", original.id)).toMatchObject({ match: "yes", matchVersion: `${MATCHING_VERSION}:initial` });
+    expect(await store.get("offer", original.id)).toMatchObject({
+      match: "yes",
+      matchVersion: `${MATCHING_VERSION}:initial`,
+    });
     expect(await store.get("offer", manual.id)).toEqual(manual);
-    expect(mock.evaluate).toHaveBeenCalledTimes(1);
+    expect(mock.evaluate).toHaveBeenCalledTimes(2);
   });
-  it("обрабатывает несколько опросов одним вызовом при лимите в один запрос", async () => {
+  it("сохраняет извлечение при лимите, затем продолжает личные оценки без повторного извлечения", async () => {
     const previousLimit = config.maxCalls;
     config.maxCalls = 1;
     try {
-      mock.extract.mockResolvedValue({ surveys: [item, { ...item, title: "Другое исследование", dedupKey: "another-study", applyUrl: null }] });
+      mock.extract.mockResolvedValue({
+        surveys: [
+          item,
+          {
+            ...item,
+            title: "Другое исследование",
+            dedupKey: "another-study",
+            applyUrl: null,
+          },
+        ],
+      });
       await runCollection(job());
-      expect(await store.list("offer")).toHaveLength(2);
+      expect(await store.list("catalog")).toHaveLength(2);
+      expect(await store.list("offer")).toHaveLength(0);
       expect(mock.extract).toHaveBeenCalledTimes(1);
       expect(mock.evaluate).not.toHaveBeenCalled();
       expect(mock.duplicates).not.toHaveBeenCalled();
-    } finally { config.maxCalls = previousLimit; }
+      config.maxCalls = 10;
+      await runCollection(job());
+      expect(await store.list("offer")).toHaveLength(2);
+      expect(mock.extract).toHaveBeenCalledTimes(1);
+    } finally {
+      config.maxCalls = previousLimit;
+    }
   });
   it("не объединяет две отдельные истории участия", async () => {
     await runCollection(job());
     const original = (await store.list<Offer>("offer"))[0];
     await store.put("offer", original.id, { ...original, stage: "paid" });
-    await store.put("offer", "second", { ...original, id: "second", stage: "booked" });
+    await store.put("offer", "second", {
+      ...original,
+      id: "second",
+      catalogId: "second",
+      stage: "booked",
+    });
+    await store.put("catalog", "second", {
+      ...original,
+      id: "second",
+      stage: "new",
+      catalogId: undefined,
+    });
     mock.duplicates.mockResolvedValue({ groups: [[original.id, "second"]] });
     await runCollection(job());
-    expect((await store.list<Offer>("offer")).filter((o) => !o.duplicateOf)).toHaveLength(2);
+    expect(
+      (await store.list<Offer>("offer")).filter((o) => !o.duplicateOf),
+    ).toHaveLength(2);
   });
   it("не скрывает карточки при некорректной группе повторов от ИИ", async () => {
     await runCollection(job());
     const original = (await store.list<Offer>("offer"))[0];
-    await store.put("offer", "second", { ...original, id: "second" });
-    mock.duplicates.mockResolvedValue({ groups: [[original.id, "second"], ["invented", original.id]] });
+    await store.put("offer", "second", {
+      ...original,
+      id: "second",
+      catalogId: "second",
+    });
+    await store.put("catalog", "second", {
+      ...original,
+      id: "second",
+      stage: "new",
+      catalogId: undefined,
+    });
+    mock.duplicates.mockResolvedValue({
+      groups: [
+        [original.id, "second"],
+        ["invented", original.id],
+      ],
+    });
     await runCollection(job());
-    expect((await store.list<Offer>("offer")).every((o) => !o.duplicateOf)).toBe(true);
+    expect(
+      (await store.list<Offer>("offer")).every((o) => !o.duplicateOf),
+    ).toBe(true);
     expect(await store.get("control", "dedup:last-error")).toMatchObject({
-      category: "groups", jobId: job().id, offerId: original.id,
+      category: "groups",
+      jobId: job().id,
+      offerId: original.id,
       candidateIds: ["second"],
     });
-    expect(await store.get<Job>("job", job().id)).toMatchObject({status: "done", incomplete: true});
+    expect(await store.get<Job>("job", job().id)).toMatchObject({
+      status: "done",
+      incomplete: true,
+    });
   });
-  it("передаёт полную анкету и отказы в общий запрос без отдельной оценки", async () => {
+  it("отделяет общее извлечение от оценки по полной личной анкете", async () => {
     const profile = profileSchema.parse({
       about: "Есть ребёнок",
       profession: "Дизайнер",
     });
     await store.put("profile", "owner", profile);
     await runCollection(job());
-    expect(mock.extract.mock.calls[0][2]).toEqual(profile);
-    expect(mock.evaluate).not.toHaveBeenCalled();
+    expect(mock.extract.mock.calls[0][2]).toEqual(profileSchema.parse({}));
+    expect(mock.evaluate.mock.calls[0][1]).toEqual(profile);
   });
   it("объединяет семантический повтор с другим названием, сохраняя скрытие", async () => {
     await runCollection(job());
@@ -225,9 +299,16 @@ describe("Восстановление сбора и пользовательс�
     await store.put("offer", "old-copy", {
       ...original,
       id: "old-copy",
+      catalogId: "old-copy",
       title: "Другая формулировка",
       stage: "saved",
       note: "Моя заметка",
+    });
+    await store.put("catalog", "old-copy", {
+      ...original,
+      id: "old-copy",
+      stage: "new",
+      catalogId: undefined,
     });
     mock.duplicates.mockResolvedValue({ groups: [[original.id, "old-copy"]] });
     await runCollection(job());

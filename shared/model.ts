@@ -35,7 +35,10 @@ export const profileSchema = z.object({
 });
 export type Profile = z.infer<typeof profileSchema>;
 export const settingsSchema = z.object({
-  eveningCollectionTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).default("21:00"),
+  eveningCollectionTime: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
+    .default("21:00"),
   collectionTime: z
     .string()
     .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
@@ -67,6 +70,7 @@ export interface AccountChannel {
   username: string | null;
 }
 export interface RawMessage {
+  collectedAt?: string;
   id: string;
   sourceId: string;
   messageId: number;
@@ -99,6 +103,8 @@ export const extractedSchema = z.object({
 });
 export type Extracted = z.infer<typeof extractedSchema>;
 export interface Offer extends Extracted {
+  catalogId?: string;
+  catalogUpdatedAt?: string;
   manuallyAdded?: boolean;
   id: string;
   createdAt: string;
@@ -189,7 +195,23 @@ export interface PushSubscriptionRecord {
   subscription: { endpoint: string; keys: { p256dh: string; auth: string } };
   lastDay?: string;
 }
+export interface User {
+  id: string;
+  name: string;
+  normalizedName: string;
+  passwordHash: string;
+  createdAt: string;
+  role: "owner" | "member";
+}
+export type PublicUser = Pick<User, "id" | "name" | "role">;
+export interface AuthState {
+  authenticated: boolean;
+  demo: boolean;
+  account: PublicUser | null;
+  accounts: PublicUser[];
+}
 export interface AppData {
+  account: PublicUser;
   demo: boolean;
   profile: Profile;
   settings: Settings;
@@ -210,7 +232,13 @@ export const manualOfferSchema = z.object({
   format: z.enum(["online", "offline", "unknown"]).default("unknown"),
   city: z.string().trim().max(100).nullable().default(null),
   dateLabel: z.string().trim().max(160).nullable().default(null),
-  applyUrl: z.string().url().max(2048).refine(v => /^https?:\/\//i.test(v), "Нужна ссылка http или https").nullable().default(null),
+  applyUrl: z
+    .string()
+    .url()
+    .max(2048)
+    .refine((v) => /^https?:\/\//i.test(v), "Нужна ссылка http или https")
+    .nullable()
+    .default(null),
 });
 export const offerPatchSchema = z.object({
   stage: stageSchema.optional(),

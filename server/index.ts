@@ -4,12 +4,12 @@ import rateLimit from "@fastify/rate-limit";
 import staticPlugin from "@fastify/static";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { z, ZodError } from "zod";
 import { config } from "./config";
 import { isAllowedOrigin } from "./origin";
 import { store } from "./store";
-import { tokenHash, verifyPassword } from "./security";
+import { tokenHash, verifyPassword, hashPassword } from "./security";
 import { seedDemo } from "./demo";
 import {
   telegramConnected,
@@ -41,7 +41,20 @@ import {
   type Job,
   type PushSubscriptionRecord,
 } from "../shared/model";
+import {
+  migrateAccounts,
+  credentialsSchema,
+  normalizeName,
+  publicUser,
+  readSession,
+  updateSession,
+  grantAccount,
+  newAccountProfile,
+} from "./accounts";
+import type { User } from "../shared/model";
 export async function createServer() {
+  if (config.demo) await seedDemo();
+  await migrateAccounts();
   const app = Fastify({
     logger: process.env.VITEST
       ? false
@@ -72,14 +85,37 @@ export async function createServer() {
       )
         return reply.code(403).send({ error: "Недопустимый источник запроса" });
     }
-    if (["/api/auth", "/api/health"].includes(req.url.split("?")[0])) return;
-    if (config.demo) return;
-    const token = req.cookies.opros_session,
-      session = token
-        ? await store.get<{ expires: number }>("session", tokenHash(token))
-        : null;
-    if (!session || session.expires < Date.now())
-      return reply.code(401).send({ error: "Войди в приложение" });
+    if (
+      ["/api/auth", "/api/register", "/api/health"].includes(
+        req.url.split("?")[0],
+      )
+    )
+      return;
+    const session = await readSession(req);
+    const accountId =
+      session?.activeUserId ||
+      (config.demo && !req.cookies.opros_demo_signed_out ? "owner" : "");
+    const user = accountId ? await store.get<User>("user", accountId) : null;
+    if (!user) return reply.code(401).send({ error: "Войди в приложение" });
+    req.accountId = user.id;
+    req.accountRole = user.role;
+    req.accountSession = session;
+    const expected = req.headers["x-opros-account"];
+    if (expected && expected !== user.id)
+      return reply
+        .code(409)
+        .send({ error: "Аккаунт изменился. Обнови страницу." });
+    const path = req.url.split("?")[0];
+    const admin =
+      path.startsWith("/api/telegram") ||
+      path.startsWith("/api/sources") ||
+      path.startsWith("/api/collect") ||
+      path === "/api/ai/test";
+    if (admin && user.role !== "owner")
+      return reply.code(403).send({ error: "Этим управляет Денис" });
+  });
+  app.addHook("preHandler", (req, _reply, done) => {
+    store.as(req.accountId || "owner", done);
   });
   app.setErrorHandler(
     (error: Error & { code?: string; statusCode?: number }, req, reply) => {
@@ -114,66 +150,145 @@ export async function createServer() {
     return { ok: true };
   });
   app.get("/api/auth", async (req) => {
-    if (config.demo) return { authenticated: true, demo: true };
-    const session = req.cookies.opros_session
-      ? await store.get<{ expires: number }>(
-          "session",
-          tokenHash(req.cookies.opros_session),
-        )
-      : null;
+    const session = await readSession(req);
+    const userIds =
+      session?.userIds ||
+      (config.demo && !req.cookies.opros_demo_signed_out ? ["owner"] : []);
+    const users = (
+      await Promise.all(userIds.map((id) => store.get<User>("user", id)))
+    ).filter((u): u is User => !!u);
+    const account = users.find(
+      (u) => u.id === (session?.activeUserId || "owner"),
+    );
     return {
-      authenticated: !!session && session.expires > Date.now(),
-      demo: false,
+      authenticated: !!account,
+      demo: config.demo,
+      account: account ? publicUser(account) : null,
+      accounts: users.map(publicUser),
     };
   });
-  app.post(
-    "/api/auth",
-    { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } },
-    async (req, reply) => {
-      if (config.demo) return { ok: true };
-      const { password } = z
-        .object({ password: z.string().max(512) })
-        .parse(req.body);
-      if (!verifyPassword(password, config.passwordHash))
-        return reply.code(401).send({ error: "Неверный пароль" });
-      for (const session of await store.list<{ id: string; expires: number }>(
-        "session",
-      ))
-        if (session.expires < Date.now())
-          await store.remove("session", session.id);
-      const token = randomBytes(32).toString("hex"),
-        id = tokenHash(token);
-      await store.put("session", id, {
-        id,
-        expires: Date.now() + 30 * 86400000,
-      });
-      reply.setCookie("opros_session", token, {
-        httpOnly: true,
-        secure: config.production,
-        sameSite: "strict",
-        path: "/",
-        maxAge: 30 * 86400,
+  const loginLimit = {
+    config: { rateLimit: { max: 5, timeWindow: "1 minute" } },
+  };
+  app.post("/api/auth", loginLimit, async (req, reply) => {
+    // Password-only requests remain compatible with the old owner's login.
+    const input = credentialsSchema.parse({
+      name: "Денис",
+      ...(req.body as object),
+    });
+    const user = (await store.list<User>("user")).find(
+      (u) => u.normalizedName === normalizeName(input.name),
+    );
+    if (!verifyPassword(input.password, user?.passwordHash || "invalid"))
+      return reply.code(401).send({ error: "Неверное имя или пароль" });
+    await grantAccount(req, reply, user!.id);
+    return { ok: true, account: publicUser(user!) };
+  });
+  app.post("/api/register", loginLimit, async (req, reply) => {
+    const input = credentialsSchema
+      .extend({
+        password: z.string().min(12, "Пароль — минимум 12 символов").max(512),
+      })
+      .parse(req.body);
+    const normalizedName = normalizeName(input.name);
+    if (!normalizedName) throw new Error("Укажи имя");
+    const release = await store.lock("accounts:registration", 30);
+    if (!release)
+      return reply
+        .code(409)
+        .send({ error: "Регистрация занята. Попробуй ещё раз." });
+    try {
+      if (
+        (await store.list<User>("user")).some(
+          (u) => u.normalizedName === normalizedName,
+        )
+      )
+        return reply.code(409).send({ error: "Это имя уже занято" });
+      const user: User = {
+        id: randomUUID(),
+        name: input.name.normalize("NFKC").trim().replace(/\s+/gu, " "),
+        normalizedName,
+        passwordHash: hashPassword(input.password),
+        createdAt: new Date().toISOString(),
+        role: "member",
+      };
+      await store.put("user", user.id, user);
+      await newAccountProfile(user.id, user.name);
+      await grantAccount(req, reply, user.id);
+      return { ok: true, account: publicUser(user) };
+    } finally {
+      await release();
+    }
+  });
+  app.post("/api/accounts/switch", async (req, reply) => {
+    const { userId } = z.object({ userId: z.string() }).parse(req.body);
+    return updateSession(req, async (session) => {
+      if (
+        !session?.userIds.includes(userId) ||
+        !(await store.get("user", userId))
+      )
+        return reply.code(403).send({ error: "Сначала войди в этот аккаунт" });
+      await store.put("session", session.id, {
+        ...session,
+        activeUserId: userId,
       });
       return { ok: true };
-    },
-  );
-  app.post("/api/logout", async (req, reply) => {
-    if (req.cookies.opros_session)
-      await store.remove("session", tokenHash(req.cookies.opros_session));
-    reply.clearCookie("opros_session", { path: "/" });
-    return { ok: true };
+    });
   });
-  app.get("/api/state", async () => ({
+  app.post("/api/logout", async (req, reply) => {
+    const { all } = z
+      .object({ all: z.boolean().default(false) })
+      .parse(req.body || {});
+    return updateSession(req, async (session) => {
+      const remaining =
+        session?.userIds.filter((id) => id !== session.activeUserId) || [];
+      if (session && !all && remaining.length) {
+        await store.put("session", session.id, {
+          ...session,
+          userIds: remaining,
+          activeUserId: remaining[0],
+        });
+      } else {
+        if (session) await store.remove("session", session.id);
+        reply.clearCookie("opros_session", { path: "/" });
+        if (config.demo)
+          reply.setCookie("opros_demo_signed_out", "1", {
+            httpOnly: true,
+            sameSite: "strict",
+            path: "/",
+          });
+      }
+      return { ok: true };
+    });
+  });
+  app.get("/api/state", async (req) => ({
+    account: publicUser((await store.get<User>("user", req.accountId))!),
     demo: config.demo,
     profile:
       (await store.get<Profile>("profile", "owner")) || profileSchema.parse({}),
-    settings:
-      settingsSchema.parse((await store.get<Settings>("profile", "settings")) || {}),
+    settings: settingsSchema.parse({
+      ...((await store.get<Settings>("profile", "settings")) || {}),
+      ...((await store.get("profile", "notification")) || {}),
+    }),
     offers: (await store.list<Offer>("offer")).filter((o) => !o.duplicateOf),
-    sources: await store.list<Source>("source"),
+    sources:
+      req.accountRole === "owner" ? await store.list<Source>("source") : [],
     feedback: await store.list<Feedback>("feedback"),
     digests: await store.list<Digest>("digest"),
-    jobs: await store.list<Job>("job"),
+    jobs: (await store.list<Job>("job"))
+      .filter((j) => j.kind === "collect")
+      .map((j) =>
+        req.accountRole === "owner"
+          ? j
+          : {
+              ...j,
+              error: undefined,
+              sourceCursors: undefined,
+              progress: j.progress
+                ? { ...j.progress, sourceName: undefined }
+                : undefined,
+            },
+      ),
     telegram: {
       configured: !!(config.telegramId && config.telegramHash),
       connected: await telegramConnected(),
@@ -198,33 +313,79 @@ export async function createServer() {
     await store.put("profile", "revision", { value: randomUUID() });
     return { ok: true };
   });
-  app.put("/api/settings", async (req) => {
-    await store.put("profile", "settings", settingsSchema.parse(req.body));
+  app.put("/api/settings", async (req, reply) => {
+    const settings = settingsSchema.parse(req.body);
+    const shared = settingsSchema.parse(
+      (await store.get("profile", "settings")) || {},
+    );
+    if (
+      req.accountRole !== "owner" &&
+      (settings.collectionTime !== shared.collectionTime ||
+        settings.eveningCollectionTime !== shared.eveningCollectionTime)
+    )
+      return reply.code(403).send({ error: "Расписание сбора меняет Денис" });
+    if (req.accountRole === "owner")
+      await store.put("profile", "settings", {
+        ...settings,
+        notificationTime: shared.notificationTime,
+      });
+    await store.put("profile", "notification", {
+      notificationTime: settings.notificationTime,
+    });
     return { ok: true };
   });
   app.post("/api/offers", async (req) => {
     const input = manualOfferSchema.parse(req.body);
-    const id = randomUUID(), now = new Date().toISOString();
+    const id = randomUUID(),
+      now = new Date().toISOString();
     const offer: Offer = {
-      ...input, id, isSurvey: true, manuallyAdded: true,
-      createdAt: now, updatedAt: now, day: moscowDay(), stage: "new",
-      match: "maybe", reasons: ["Добавлено вручную"], questions: [], score: 50,
-      currency: "RUB", startsAt: null, deadline: null,
-      requirements: [], category: "Другое", ageMin: null, ageMax: null,
-      gender: null, organizer: null, dedupKey: `manual:${id}`,
-      sources: [{ messageId: `manual:${id}`, name: "Добавлено вручную", url: input.applyUrl || "", text: input.summary }],
-      note: "", participationDate: null, actualReward: null,
+      ...input,
+      id,
+      isSurvey: true,
+      manuallyAdded: true,
+      createdAt: now,
+      updatedAt: now,
+      day: moscowDay(),
+      stage: "new",
+      match: "maybe",
+      reasons: ["Добавлено вручную"],
+      questions: [],
+      score: 50,
+      currency: "RUB",
+      startsAt: null,
+      deadline: null,
+      requirements: [],
+      category: "Другое",
+      ageMin: null,
+      ageMax: null,
+      gender: null,
+      organizer: null,
+      dedupKey: `manual:${id}`,
+      sources: [
+        {
+          messageId: `manual:${id}`,
+          name: "Добавлено вручную",
+          url: input.applyUrl || "",
+          text: input.summary,
+        },
+      ],
+      note: "",
+      participationDate: null,
+      actualReward: null,
     };
     await store.put("offer", id, offer);
     return { id, day: offer.day };
   });
   app.patch<{ Params: { id: string } }>("/api/offers/:id", async (req) => {
     const patch = offerPatchSchema.parse(req.body),
-      unlock = await store.lock(`offer:${req.params.id}`, 30);
+      unlock = await store.lock(`offer:${req.accountId}:${req.params.id}`, 30);
     if (!unlock) throw new Error("Предложение обновляется, повтори действие");
     try {
       const offer = await store.get<Offer>("offer", req.params.id);
-      if (!offer) throw new Error("Предложение не найдено");
+      if (!offer)
+        throw Object.assign(new Error("Предложение не найдено"), {
+          statusCode: 404,
+        });
       await store.put("offer", offer.id, {
         ...offer,
         ...patch,
@@ -237,11 +398,14 @@ export async function createServer() {
   });
   app.post("/api/feedback", async (req) => {
     const input = feedbackSchema.parse(req.body),
-      unlock = await store.lock(`offer:${input.offerId}`, 30);
+      unlock = await store.lock(`offer:${req.accountId}:${input.offerId}`, 30);
     if (!unlock) throw new Error("Предложение обновляется");
     try {
       const offer = await store.get<Offer>("offer", input.offerId);
-      if (!offer) throw new Error("Предложение не найдено");
+      if (!offer)
+        throw Object.assign(new Error("Предложение не найдено"), {
+          statusCode: 404,
+        });
       const feedback: Feedback = {
         ...input,
         id: randomUUID(),
@@ -268,7 +432,8 @@ export async function createServer() {
     if (patch.permanent && patch.rule.trim().length < 3)
       throw new Error("Укажи условие исключения");
     const f = await store.get<Feedback>("feedback", req.params.id);
-    if (!f) throw new Error("Причина не найдена");
+    if (!f)
+      throw Object.assign(new Error("Причина не найдена"), { statusCode: 404 });
     if (f.scope === "timing" && patch.permanent)
       throw new Error("Разовая занятость не может быть постоянным запретом");
     await store.put("feedback", f.id, { ...f, ...patch });
@@ -276,6 +441,8 @@ export async function createServer() {
     return { ok: true };
   });
   app.delete<{ Params: { id: string } }>("/api/feedback/:id", async (req) => {
+    if (!(await store.get("feedback", req.params.id)))
+      throw Object.assign(new Error("Причина не найдена"), { statusCode: 404 });
     await store.remove("feedback", req.params.id);
     await store.put("profile", "revision", { value: randomUUID() });
     return { ok: true };
@@ -334,12 +501,19 @@ export async function createServer() {
       };
     return enqueueCollection(moscowDay(), { manual: true, ...input });
   });
-  app.post<{ Params: { id: string } }>("/api/collect/:id/cancel", async (req) => {
-    return cancelCollection(z.string().min(1).max(100).parse(req.params.id));
-  });
-  app.post("/api/telegram/test", {
-    config: { rateLimit: { max: 3, timeWindow: "1 minute" } },
-  }, async () => testTelegramConnection());
+  app.post<{ Params: { id: string } }>(
+    "/api/collect/:id/cancel",
+    async (req) => {
+      return cancelCollection(z.string().min(1).max(100).parse(req.params.id));
+    },
+  );
+  app.post(
+    "/api/telegram/test",
+    {
+      config: { rateLimit: { max: 3, timeWindow: "1 minute" } },
+    },
+    async () => testTelegramConnection(),
+  );
   app.post(
     "/api/ai/test",
     { config: { rateLimit: { max: 3, timeWindow: "1 minute" } } },
@@ -396,15 +570,33 @@ export async function createServer() {
     )
       throw new Error("Неподдерживаемый push-сервис");
     const id = tokenHash(subscription.endpoint);
-    const existing = await store.get<PushSubscriptionRecord>(
-      "subscription",
-      id,
-    );
-    await store.put<PushSubscriptionRecord>("subscription", id, {
-      id,
-      subscription,
-      lastDay: existing?.lastDay,
-    });
+    const release = await store.lock(`push:${id}`, 30);
+    if (!release) throw new Error("Подписка обновляется. Попробуй ещё раз.");
+    try {
+      const session = await readSession(req);
+      if (
+        (!session && !config.demo) ||
+        (session && session.activeUserId !== req.accountId)
+      )
+        throw Object.assign(new Error("Аккаунт изменился. Обнови страницу."), {
+          statusCode: 409,
+        });
+      for (const user of await store.list<User>("user")) {
+        if (user.id !== req.accountId)
+          await store.as(user.id, () => store.remove("subscription", id));
+      }
+      const existing = await store.get<PushSubscriptionRecord>(
+        "subscription",
+        id,
+      );
+      await store.put<PushSubscriptionRecord>("subscription", id, {
+        id,
+        subscription,
+        lastDay: existing?.lastDay,
+      });
+    } finally {
+      await release();
+    }
     return { ok: true };
   });
   app.delete("/api/push", async (req) => {

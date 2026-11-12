@@ -12,6 +12,7 @@ import {
   Route,
   useSearchParams,
   useLocation,
+  useNavigate,
   Link,
 } from "react-router-dom";
 import {
@@ -49,11 +50,12 @@ import {
   WifiOff,
   type LucideIcon,
 } from "lucide-react";
-import { api, ApiError } from "./api";
+import { api, ApiError, setApiAccount } from "./api";
 import {
   moscowDay,
   stageNames,
   type AppData,
+  type AuthState,
   type Offer,
   type Profile,
   type Stage,
@@ -194,18 +196,22 @@ export default function App() {
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "instant" });
   }, [location.pathname]);
+  const navigate = useNavigate();
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [accountBusy, setAccountBusy] = useState(false);
   const queryClient = useQueryClient(),
     [toast, setToast] = useState<Toast | null>(null),
     [online, setOnline] = useState(navigator.onLine),
     [update, setUpdate] = useState<null | (() => void)>(null);
   const auth = useQuery({
     queryKey: ["auth"],
-    queryFn: () => api<{ authenticated: boolean; demo: boolean }>("/auth"),
+    queryFn: () => api<AuthState>("/auth"),
     retry: false,
   });
+  setApiAccount(auth.data?.account?.id);
   const state = useQuery({
-    queryKey: ["state"],
-    queryFn: () => api<AppData>("/state"),
+    queryKey: ["state", auth.data?.account?.id],
+    queryFn: ({ signal }) => api<AppData>("/state", "GET", undefined, signal),
     enabled: auth.data?.authenticated === true,
     refetchInterval: (query) =>
       query.state.data?.jobs.some(
@@ -217,9 +223,75 @@ export default function App() {
     retry: false,
   });
   useEffect(() => {
-    if (state.error instanceof ApiError && state.error.status === 401)
+    if (
+      state.error instanceof ApiError &&
+      [401, 409].includes(state.error.status)
+    ) {
+      queryClient.removeQueries({ queryKey: ["state"] });
       void auth.refetch();
+    }
   }, [state.error]);
+  async function reloadAccount(broadcast = true) {
+    await queryClient.cancelQueries();
+    queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== "auth" });
+    setToast(null);
+    setAddingAccount(false);
+    await auth.refetch();
+    if (broadcast && typeof BroadcastChannel !== "undefined") {
+      const channel = new BroadcastChannel("opros-accounts");
+      channel.postMessage("changed");
+      channel.close();
+    }
+  }
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return;
+    const channel = new BroadcastChannel("opros-accounts");
+    channel.onmessage = () => {
+      void reloadAccount(false);
+    };
+    return () => channel.close();
+  }, []);
+  useEffect(() => {
+    const target = new URLSearchParams(location.search).get("account");
+    if (
+      !auth.data?.authenticated ||
+      !target ||
+      target === auth.data.account?.id
+    )
+      return;
+    if (auth.data.accounts.some((a) => a.id === target)) {
+      void api("/accounts/switch", "POST", { userId: target })
+        .then(() => reloadAccount())
+        .catch((e) => setToast({ text: e.message }));
+    } else {
+      setAddingAccount(true);
+    }
+  }, [auth.data?.account?.id, location.search]);
+  useEffect(() => {
+    if (
+      !auth.data?.account ||
+      !state.data?.push.configured ||
+      !("serviceWorker" in navigator)
+    )
+      return;
+    let active = true;
+    void navigator.serviceWorker.ready
+      .then(async (registration) => {
+        const sub = await registration.pushManager.getSubscription();
+        if (active && sub)
+          await api(
+            "/push",
+            "POST",
+            sub.toJSON(),
+            undefined,
+            auth.data!.account!.id,
+          );
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [auth.data?.account?.id, state.data?.push.configured]);
   const notify: Notify = (text, action, label = "Отменить") =>
     setToast({ text, action, label });
   useEffect(() => {
@@ -277,8 +349,19 @@ export default function App() {
         </button>
       </div>
     );
-  if (!auth.data?.authenticated)
-    return <Login onLogin={() => auth.refetch()} />;
+  if (!auth.data?.authenticated || addingAccount)
+    return (
+      <Login
+        onLogin={(registered) => {
+          void reloadAccount().then(() =>
+            navigate(registered ? "/settings" : `/${location.search}`),
+          );
+        }}
+        onCancel={
+          auth.data?.authenticated ? () => setAddingAccount(false) : undefined
+        }
+      />
+    );
   if (state.isPending || !state.data)
     return (
       <div className="boot">
@@ -306,7 +389,7 @@ export default function App() {
     { to: "/settings", icon: Settings2, label: "Настройки", count: 0 },
   ];
   return (
-    <div className="app-shell">
+    <div className="app-shell" key={data.account.id}>
       <aside className="sidebar">
         <Link className="brand" to="/" aria-label="Отклик — на главную">
           <img src="/icon.svg" alt="" />
@@ -325,11 +408,16 @@ export default function App() {
           <Link to="/settings?tab=sources">
             <Radio size={16} />
             <span>Источники</span>
-            <b>{data.sources.filter((s) => s.enabled).length}</b>
+            {data.account.role === "owner" && (
+              <b>{data.sources.filter((s) => s.enabled).length}</b>
+            )}
           </Link>
           <Link to="/settings?tab=notifications">
             <Clock3 size={16} />
-            <span>Сбор {data.settings.collectionTime} и {data.settings.eveningCollectionTime} МСК</span>
+            <span>
+              Сбор {data.settings.collectionTime} и{" "}
+              {data.settings.eveningCollectionTime} МСК
+            </span>
           </Link>
         </div>
         <Link className="archive-link" to="/hidden">
@@ -356,6 +444,38 @@ export default function App() {
             Отклик
           </div>
           <div className="topbar-right">
+            <label className="account-switcher">
+              <span className="sr-only">Текущий аккаунт</span>
+              <select
+                aria-label="Переключить аккаунт"
+                value={data.account.id}
+                disabled={accountBusy}
+                onChange={async (e) => {
+                  const id = e.target.value;
+                  if (id === "add") {
+                    setAddingAccount(true);
+                    return;
+                  }
+                  setAccountBusy(true);
+                  try {
+                    await api("/accounts/switch", "POST", { userId: id });
+                    await reloadAccount();
+                    navigate("/");
+                  } catch (e) {
+                    notify((e as Error).message);
+                  } finally {
+                    setAccountBusy(false);
+                  }
+                }}
+              >
+                {auth.data.accounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name}
+                  </option>
+                ))}
+                <option value="add">Добавить аккаунт…</option>
+              </select>
+            </label>
             {data.demo && (
               <span className="demo-badge">
                 <span />
@@ -439,10 +559,30 @@ export default function App() {
                 data={data}
                 refresh={refresh}
                 notify={notify}
-                logout={async () => {
-                  await api("/logout", "POST");
-                  queryClient.clear();
-                  await auth.refetch();
+                logout={async (all) => {
+                  if ("serviceWorker" in navigator) {
+                    const registration =
+                      await navigator.serviceWorker.getRegistration();
+                    const sub =
+                      await registration?.pushManager.getSubscription();
+                    if (sub)
+                      await api(
+                        "/push",
+                        "DELETE",
+                        { endpoint: sub.endpoint },
+                        undefined,
+                        data.account.id,
+                      );
+                  }
+                  await api(
+                    "/logout",
+                    "POST",
+                    { all },
+                    undefined,
+                    data.account.id,
+                  );
+                  await reloadAccount();
+                  navigate("/");
                 }}
               />
             }
@@ -472,7 +612,16 @@ export default function App() {
   );
 }
 
-function Login({ onLogin }: { onLogin: () => void }) {
+function Login({
+  onLogin,
+  onCancel,
+}: {
+  onLogin: (registered: boolean) => void;
+  onCancel?: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [register, setRegister] = useState(false);
+  const [confirmation, setConfirmation] = useState("");
   const [password, setPassword] = useState(""),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
@@ -481,8 +630,10 @@ function Login({ onLogin }: { onLogin: () => void }) {
     setBusy(true);
     setError("");
     try {
-      await api("/auth", "POST", { password });
-      onLogin();
+      if (register && password !== confirmation)
+        throw new Error("Пароли не совпадают");
+      await api(register ? "/register" : "/auth", "POST", { name, password });
+      onLogin(register);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -496,26 +647,71 @@ function Login({ onLogin }: { onLogin: () => void }) {
           <img src="/icon.svg" alt="" />
           <span>Отклик</span>
         </div>
-        <h1>Вход</h1>
+        <h1>{register ? "Регистрация" : "Вход"}</h1>
+        <label>
+          Имя
+          <input
+            autoComplete="username"
+            required
+            maxLength={80}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
         <label>
           Пароль
           <input
             type="password"
-            autoComplete="current-password"
+            autoComplete={register ? "new-password" : "current-password"}
+            minLength={register ? 12 : undefined}
+            maxLength={512}
             required
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
         </label>
+        {register && (
+          <>
+            <p className="helper">Пароль — минимум 12 символов.</p>
+            <label>
+              Повтори пароль
+              <input
+                type="password"
+                autoComplete="new-password"
+                required
+                value={confirmation}
+                onChange={(e) => setConfirmation(e.target.value)}
+              />
+            </label>
+          </>
+        )}
         {error && (
           <p className="error" role="alert">
             {error}
           </p>
         )}
         <button className="primary" disabled={busy}>
-          {busy ? "Входим…" : "Войти"}
+          {busy ? "Подожди…" : register ? "Создать аккаунт" : "Войти"}
           <I icon={ArrowUpRight} size={18} />
         </button>
+        <button
+          type="button"
+          className="text-link"
+          disabled={busy}
+          onClick={() => {
+            setRegister(!register);
+            setError("");
+            setPassword("");
+            setConfirmation("");
+          }}
+        >
+          {register ? "Уже есть аккаунт — войти" : "Зарегистрироваться"}
+        </button>
+        {onCancel && (
+          <button type="button" disabled={busy} onClick={onCancel}>
+            Вернуться в кабинет
+          </button>
+        )}
       </form>
     </div>
   );
@@ -594,15 +790,19 @@ function Feed({ data, refresh, notify }: Common) {
           <h1>Лента</h1>
         </div>
         <div className="feed-actions">
-        <button className="secondary" onClick={() => setManualOpen(true)}><Plus size={17} />Добавить</button>
-        <button
-          className="secondary collect-button"
-          onClick={() => setCollectionOpen(true)}
-          aria-label="Ручной сбор каналов"
-        >
-          <I icon={RefreshCw} size={17} />
-          <span>Собрать</span>
-        </button>
+          <button className="secondary" onClick={() => setManualOpen(true)}>
+            <Plus size={17} />
+            Добавить
+          </button>
+          <button
+            className="secondary collect-button"
+            disabled={data.account.role !== "owner"}
+            onClick={() => setCollectionOpen(true)}
+            aria-label="Ручной сбор каналов"
+          >
+            <I icon={RefreshCw} size={17} />
+            <span>Собрать</span>
+          </button>
         </div>
       </div>
       {data.jobs.some(
@@ -620,7 +820,11 @@ function Feed({ data, refresh, notify }: Common) {
               )!,
             )}
           </span>
-          <button className="text-link" onClick={() => setCollectionOpen(true)}>
+          <button
+            className="text-link"
+            disabled={data.account.role !== "owner"}
+            onClick={() => setCollectionOpen(true)}
+          >
             Состояние
           </button>
         </div>
@@ -791,7 +995,17 @@ function Feed({ data, refresh, notify }: Common) {
         />
       )}
       {details && <Details offer={details} onClose={() => setDetails(null)} />}
-      {manualOpen && <ManualOfferModal onClose={() => setManualOpen(false)} onAdded={async (day) => { setParams({ day }); await refresh(); setManualOpen(false); notify("Опрос добавлен"); }} />}
+      {manualOpen && (
+        <ManualOfferModal
+          onClose={() => setManualOpen(false)}
+          onAdded={async (day) => {
+            setParams({ day });
+            await refresh();
+            setManualOpen(false);
+            notify("Опрос добавлен");
+          }}
+        />
+      )}
       {collectionOpen && (
         <CollectionModal
           data={data}
@@ -804,39 +1018,146 @@ function Feed({ data, refresh, notify }: Common) {
   );
 }
 
-function ManualOfferModal({ onClose, onAdded }: { onClose: () => void; onAdded: (day: string) => Promise<void> }) {
-  const [form, setForm] = useState({ title: "", summary: "", reward: "", duration: "", city: "", dateLabel: "", applyUrl: "", format: "unknown" });
-  const [busy, setBusy] = useState(false), [error, setError] = useState("");
-  const set = (key: keyof typeof form, value: string) => setForm(f => ({ ...f, [key]: value }));
+function ManualOfferModal({
+  onClose,
+  onAdded,
+}: {
+  onClose: () => void;
+  onAdded: (day: string) => Promise<void>;
+}) {
+  const [form, setForm] = useState({
+    title: "",
+    summary: "",
+    reward: "",
+    duration: "",
+    city: "",
+    dateLabel: "",
+    applyUrl: "",
+    format: "unknown",
+  });
+  const [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  const set = (key: keyof typeof form, value: string) =>
+    setForm((f) => ({ ...f, [key]: value }));
   async function submit(e: FormEvent) {
-    e.preventDefault(); setBusy(true); setError("");
+    e.preventDefault();
+    setBusy(true);
+    setError("");
     try {
-      const result = await api<{day: string}>("/offers", "POST", { ...form,
+      const result = await api<{ day: string }>("/offers", "POST", {
+        ...form,
         reward: form.reward === "" ? null : Number(form.reward),
         duration: form.duration === "" ? null : Number(form.duration),
-        city: form.city || null, dateLabel: form.dateLabel || null, applyUrl: form.applyUrl || null });
+        city: form.city || null,
+        dateLabel: form.dateLabel || null,
+        applyUrl: form.applyUrl || null,
+      });
       await onAdded(result.day);
-    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
   }
-  return <Modal title="Добавить опрос" onClose={onClose}>
-    <form onSubmit={submit}>
-      <p className="helper">Опрос появится в ленте за сегодня. Условия можно перенести из объявления без ИИ.</p>
-      <fieldset disabled={busy} className="manual-fields">
-        <label>Тема<input required maxLength={200} value={form.title} onChange={e => set("title", e.target.value)} /></label>
-        <label>Текст объявления<textarea required rows={6} maxLength={1500} value={form.summary} onChange={e => set("summary", e.target.value)} /></label>
-        <div className="form-grid">
-          <label>Вознаграждение, ₽<input type="number" min="0" max="10000000" value={form.reward} onChange={e => set("reward", e.target.value)} /></label>
-          <label>Длительность, мин<input type="number" min="1" max="10080" value={form.duration} onChange={e => set("duration", e.target.value)} /></label>
-          <label>Формат<select value={form.format} onChange={e => set("format", e.target.value)}><option value="unknown">Не указан</option><option value="offline">Очно</option><option value="online">Онлайн</option></select></label>
-          <label>Город<input maxLength={100} value={form.city} onChange={e => set("city", e.target.value)} /></label>
-        </div>
-        <label>Дата и варианты времени<input maxLength={160} value={form.dateLabel} onChange={e => set("dateLabel", e.target.value)} placeholder="12 ноября, 13:00 или 15:20 МСК" /></label>
-        <label>Ссылка на объявление или запись<input type="url" maxLength={2048} value={form.applyUrl} onChange={e => set("applyUrl", e.target.value)} placeholder="https://t.me/…" /></label>
-      </fieldset>
-      {error && <p className="error" role="alert">{error}</p>}
-      <button className="primary full-width" disabled={busy}>{busy ? "Добавляем…" : "Добавить в ленту"}</button>
-    </form>
-  </Modal>;
+  return (
+    <Modal title="Добавить опрос" onClose={onClose}>
+      <form onSubmit={submit}>
+        <p className="helper">
+          Опрос появится в ленте за сегодня. Условия можно перенести из
+          объявления без ИИ.
+        </p>
+        <fieldset disabled={busy} className="manual-fields">
+          <label>
+            Тема
+            <input
+              required
+              maxLength={200}
+              value={form.title}
+              onChange={(e) => set("title", e.target.value)}
+            />
+          </label>
+          <label>
+            Текст объявления
+            <textarea
+              required
+              rows={6}
+              maxLength={1500}
+              value={form.summary}
+              onChange={(e) => set("summary", e.target.value)}
+            />
+          </label>
+          <div className="form-grid">
+            <label>
+              Вознаграждение, ₽
+              <input
+                type="number"
+                min="0"
+                max="10000000"
+                value={form.reward}
+                onChange={(e) => set("reward", e.target.value)}
+              />
+            </label>
+            <label>
+              Длительность, мин
+              <input
+                type="number"
+                min="1"
+                max="10080"
+                value={form.duration}
+                onChange={(e) => set("duration", e.target.value)}
+              />
+            </label>
+            <label>
+              Формат
+              <select
+                value={form.format}
+                onChange={(e) => set("format", e.target.value)}
+              >
+                <option value="unknown">Не указан</option>
+                <option value="offline">Очно</option>
+                <option value="online">Онлайн</option>
+              </select>
+            </label>
+            <label>
+              Город
+              <input
+                maxLength={100}
+                value={form.city}
+                onChange={(e) => set("city", e.target.value)}
+              />
+            </label>
+          </div>
+          <label>
+            Дата и варианты времени
+            <input
+              maxLength={160}
+              value={form.dateLabel}
+              onChange={(e) => set("dateLabel", e.target.value)}
+              placeholder="12 ноября, 13:00 или 15:20 МСК"
+            />
+          </label>
+          <label>
+            Ссылка на объявление или запись
+            <input
+              type="url"
+              maxLength={2048}
+              value={form.applyUrl}
+              onChange={(e) => set("applyUrl", e.target.value)}
+              placeholder="https://t.me/…"
+            />
+          </label>
+        </fieldset>
+        {error && (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="primary full-width" disabled={busy}>
+          {busy ? "Добавляем…" : "Добавить в ленту"}
+        </button>
+      </form>
+    </Modal>
+  );
 }
 
 function CollectionModal({
@@ -1699,7 +2020,7 @@ function Settings({
   refresh,
   notify,
   logout,
-}: Common & { logout: () => Promise<void> }) {
+}: Common & { logout: (all?: boolean) => Promise<void> }) {
   const [params, setParams] = useSearchParams(),
     tab = params.get("tab") || "profile";
   const tabs = [
@@ -1741,11 +2062,19 @@ function Settings({
             notify={notify}
           />
         ) : tab === "sources" ? (
-          <Sources data={data} refresh={refresh} notify={notify} />
+          data.account.role === "owner" ? (
+            <Sources data={data} refresh={refresh} notify={notify} />
+          ) : (
+            <p>Источниками и сбором управляет Денис.</p>
+          )
         ) : tab === "preferences" ? (
           <Preferences data={data} refresh={refresh} notify={notify} />
         ) : tab === "connections" ? (
-          <Connections data={data} refresh={refresh} notify={notify} />
+          data.account.role === "owner" ? (
+            <Connections data={data} refresh={refresh} notify={notify} />
+          ) : (
+            <p>Общие подключения настраивает Денис.</p>
+          )
         ) : tab === "notifications" ? (
           <Notifications data={data} refresh={refresh} notify={notify} />
         ) : (
@@ -1757,12 +2086,15 @@ function Settings({
           <Archive size={17} />
           Скрытые предложения
         </Link>
-        {!data.demo && (
+        <>
           <button onClick={() => logout().catch((e) => notify(e.message))}>
             <LogOut size={17} />
-            Выйти
+            Выйти из аккаунта
           </button>
-        )}
+          <button onClick={() => logout(true).catch((e) => notify(e.message))}>
+            Выйти из всех аккаунтов
+          </button>
+        </>
       </div>
     </main>
   );
@@ -2746,7 +3078,13 @@ function Notifications({ data, refresh, notify }: Common) {
       if (subscribed) {
         const sub = await registration.pushManager.getSubscription();
         if (sub) {
-          await api("/push", "DELETE", { endpoint: sub.endpoint });
+          await api(
+            "/push",
+            "DELETE",
+            { endpoint: sub.endpoint },
+            undefined,
+            data.account.id,
+          );
           await sub.unsubscribe();
         }
         setSubscribed(false);
@@ -2765,7 +3103,7 @@ function Notifications({ data, refresh, notify }: Common) {
           userVisibleOnly: true,
           applicationServerKey: key,
         });
-        await api("/push", "POST", sub.toJSON());
+        await api("/push", "POST", sub.toJSON(), undefined, data.account.id);
         setSubscribed(true);
         notify("Ежедневные уведомления включены");
       }
@@ -2804,6 +3142,7 @@ function Notifications({ data, refresh, notify }: Common) {
             <input
               type="time"
               required
+              disabled={data.account.role !== "owner"}
               value={settings.collectionTime}
               onChange={(e) =>
                 setSettings((s) => ({ ...s, collectionTime: e.target.value }))
@@ -2812,7 +3151,18 @@ function Notifications({ data, refresh, notify }: Common) {
           </label>
           <label>
             Вечерний сбор, МСК
-            <input type="time" required value={settings.eveningCollectionTime} onChange={e => setSettings(s => ({ ...s, eveningCollectionTime: e.target.value }))} />
+            <input
+              type="time"
+              required
+              disabled={data.account.role !== "owner"}
+              value={settings.eveningCollectionTime}
+              onChange={(e) =>
+                setSettings((s) => ({
+                  ...s,
+                  eveningCollectionTime: e.target.value,
+                }))
+              }
+            />
           </label>
           <label>
             Ежедневная сводка, МСК

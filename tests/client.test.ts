@@ -1,17 +1,59 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { api } from "../src/api";
-afterEach(() => vi.unstubAllGlobals());
+import { api, setApiAccount } from "../src/api";
+afterEach(() => {
+  setApiAccount();
+  vi.unstubAllGlobals();
+});
+
+describe("Запросы привязаны к кабинету", () => {
+  it("передаёт ожидаемый аккаунт и отменяет запросы при переключении", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    vi.stubGlobal("fetch", fetch);
+    setApiAccount("owner");
+    await api("/state");
+    expect(fetch.mock.calls[0][1].headers["X-Opros-Account"]).toBe("owner");
+    let pendingSignal: AbortSignal;
+    fetch.mockImplementationOnce(async (_url, options) => {
+      pendingSignal = options.signal;
+      return new Promise((_resolve, reject) =>
+        pendingSignal.addEventListener("abort", () =>
+          reject(new DOMException("Aborted", "AbortError")),
+        ),
+      );
+    });
+    const pending = api("/state");
+    setApiAccount("anna");
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(pendingSignal!.aborted).toBe(true);
+    await expect(
+      api("/profile", "PUT", {}, undefined, "owner"),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+  it("поддерживает отмену загрузки через сигнал React Query", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetch);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      api("/state", "GET", undefined, controller.signal),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetch.mock.calls[0][1].signal.aborted).toBe(true);
+  });
+});
 describe("Запросы клиента без тела", () => {
   it("передаёт код ошибки авторизации интерфейсу", async () => {
     vi.stubGlobal(
       "fetch",
-      vi
-        .fn()
-        .mockResolvedValue({
-          ok: false,
-          status: 401,
-          json: async () => ({ error: "Войди в приложение" }),
-        }),
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: "Войди в приложение" }),
+      }),
     );
     await expect(api("/state")).rejects.toMatchObject({
       status: 401,

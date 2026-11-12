@@ -1,8 +1,9 @@
+import { personalize, personalDigests } from "./personalization";
 import { createHash, randomUUID } from "node:crypto";
 import { store } from "./store";
 import { config } from "./config";
-import { analyze, evaluate, summarize, findDuplicates } from "./ai";
-import { hardMismatch, dedupCandidate, duplicateCandidates, MATCHING_VERSION } from "./matching";
+import { analyze, findDuplicates } from "./ai";
+import { dedupCandidate, duplicateCandidates } from "./matching";
 import { mergeDuplicates } from "./dedup";
 import { duplicateError } from "./duplicate-error";
 import { validateDuplicateGroups } from "./duplicate-groups";
@@ -12,7 +13,6 @@ import { CollectionControl, COLLECTION_TIMEOUT_MS } from "./collection-control";
 import {
   moscowDay,
   profileSchema,
-  type Profile,
   type Source,
   type RawMessage,
   type Offer,
@@ -169,6 +169,7 @@ async function collectSource(
         messageId: message.id,
         text: message.message,
         date: new Date(published).toISOString(),
+        collectedAt: previous?.collectedAt || new Date().toISOString(),
         url: sourceMessageUrl(source, message.id),
         hash: hash(message.message),
         processedHash: previous?.processedHash,
@@ -271,8 +272,7 @@ export async function runCollection(job: Job) {
   await store.put("digest", digestId, digest);
   const errors: string[] = [];
   let calls = 0,
-    processed = 0,
-    added = 0;
+    processed = 0;
   try {
     await checkCancellation();
     control.check();
@@ -304,11 +304,10 @@ export async function runCollection(job: Job) {
       job.progress.sourcesDone++;
       await report(true);
     }
-    const profile =
-        (await store.get<Profile>("profile", "owner")) ||
-        profileSchema.parse({}),
-      feedback = await store.list<Feedback>("feedback");
-    const revision = `${MATCHING_VERSION}:${(await store.get<{ value: string }>("profile", "revision"))?.value || "initial"}`;
+    const profile = profileSchema.parse({});
+    const feedback: Feedback[] = [];
+    const revision = "catalog:v1";
+    calls = await personalize({ job, control, calls, report, errors });
     const active = new Set(sources.map((s) => s.id));
     const messages = (await store.list<RawMessage>("message"))
       .filter(
@@ -339,7 +338,7 @@ export async function runCollection(job: Job) {
         await report(true);
         const candidates = duplicateCandidates(
           message.text,
-          await store.list<Offer>("offer"),
+          await store.list<Offer>("catalog"),
         );
         const { surveys } = await control.wait(
           analyze(
@@ -353,20 +352,16 @@ export async function runCollection(job: Job) {
           "ИИ",
         );
         for (const analyzed of surveys) {
-          const { duplicateId, match, reasons, questions, score, ...item } =
-            analyzed;
+          const { duplicateId, ...item } = analyzed;
           control.check();
           if (!item.isSurvey) continue;
-          const mismatch = hardMismatch(item, profile),
-            assessment = mismatch
-              ? {
-                  match: "no" as const,
-                  reasons: [mismatch],
-                  questions: [],
-                  score: 0,
-                }
-              : { match, reasons, questions, score };
-          const offers = (await store.list<Offer>("offer")).filter(
+          const assessment = {
+            match: "maybe" as const,
+            reasons: [],
+            questions: [],
+            score: 50,
+          };
+          const offers = (await store.list<Offer>("catalog")).filter(
             (o) => !o.duplicateOf && !o.manuallyAdded,
           );
           const fromMessage = offers.filter((o) =>
@@ -393,11 +388,13 @@ export async function runCollection(job: Job) {
           const id = existing?.id || randomUUID(),
             updatedAt = new Date().toISOString();
           // Re-read immediately before write so worker never overwrites a user's stage or note.
-          const current = existing ? await store.get<Offer>("offer", id) : null;
+          const current = existing
+            ? await store.get<Offer>("catalog", id)
+            : null;
           const offer: Offer = {
             ...item,
             id,
-            createdAt: current?.createdAt || updatedAt,
+            createdAt: current?.createdAt || message.collectedAt || updatedAt,
             updatedAt,
             day: current?.day || job.day,
             stage: current?.stage || "new",
@@ -412,11 +409,11 @@ export async function runCollection(job: Job) {
             participationDate: current?.participationDate || null,
             actualReward: current?.actualReward ?? null,
           };
-          const unlock = await store.lock(`offer:${id}`, 30);
+          const unlock = await store.lock(`catalog:${id}`, 30);
           if (!unlock)
             throw new Error("Предложение изменяется, повторим позже");
           try {
-            const fresh = await store.get<Offer>("offer", id);
+            const fresh = await store.get<Offer>("catalog", id);
             if (fresh)
               Object.assign(offer, {
                 stage: fresh.stage,
@@ -424,12 +421,10 @@ export async function runCollection(job: Job) {
                 participationDate: fresh.participationDate,
                 actualReward: fresh.actualReward,
               });
-            await store.put("offer", id, offer);
+            await store.put("catalog", id, offer);
           } finally {
             await unlock();
           }
-          if (!existing && offer.match !== "no") added++;
-          job.progress.offersAdded = added;
         }
         await store.put("message", message.id, {
           ...message,
@@ -446,70 +441,13 @@ export async function runCollection(job: Job) {
         break;
       }
     }
-    // A changed profile or deleted rejection must also affect already extracted offers.
-    const stale = (await store.list<Offer>("offer"))
-      .filter(
-        (o) =>
-          !o.duplicateOf && !o.manuallyAdded && o.stage === "new" && o.matchVersion !== revision,
-      )
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    job.progress.recheckTotal = stale.length;
-    job.progress.sourceName = undefined;
-    for (const offer of stale) {
-      control.check();
-      if (calls >= config.maxCalls) {
-        errors.push(
-          "Персонализация обновлена частично: достигнут лимит запросов.",
-        );
-        break;
-      }
-      try {
-        const mismatch = hardMismatch(offer, profile);
-        calls++;
-        job.progress.phase = "recheck";
-        job.progress.aiCalls = calls;
-        await report(true);
-        const result = mismatch
-          ? {
-              match: "no" as const,
-              reasons: [mismatch],
-              questions: [],
-              score: 0,
-            }
-          : await control.wait(
-              evaluate(offer, profile, feedback, control.signal),
-              "ИИ",
-            );
-        const unlock = await store.lock(`offer:${offer.id}`, 30);
-        if (!unlock) continue;
-        try {
-          const fresh = await store.get<Offer>("offer", offer.id);
-          if (fresh && fresh.stage === "new")
-            await store.put("offer", offer.id, {
-              ...fresh,
-              ...result,
-              matchVersion: revision,
-            });
-        } finally {
-          await unlock();
-        }
-        job.progress.rechecked++;
-        await report(true);
-      } catch {
-        control.check();
-        errors.push(
-          "Часть предложений не удалось повторно оценить. Повторим при следующем сборе.",
-        );
-        break;
-      }
-    }
     // One-time semantic cleanup of accumulated offers, resumable within the call budget.
-    const unchecked = (await store.list<Offer>("offer"))
+    const unchecked = (await store.list<Offer>("catalog"))
       .filter((o) => !o.duplicateOf && !o.manuallyAdded)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     for (const offer of unchecked) {
-      if (calls >= config.maxCalls) break;
-      const marker = `dedup:v1:${offer.id}`;
+      if (calls >= config.maxCalls - 1) break;
+      const marker = `catalog-dedup:v1:${offer.id}`;
       if (await store.get("control", marker)) continue;
       const candidates = duplicateCandidates(
         `${offer.title} ${offer.summary} ${offer.organizer} ${offer.applyUrl}`,
@@ -529,9 +467,9 @@ export async function runCollection(job: Job) {
         );
         const allowed = new Set(batch.map((o) => o.id));
         validateDuplicateGroups(groups, allowed);
-        for (const group of groups) await mergeDuplicates(group);
+        for (const group of groups) await mergeDuplicates(group, "catalog");
         for (const checked of batch)
-          await store.put("control", `dedup:v1:${checked.id}`, {
+          await store.put("control", `catalog-dedup:v1:${checked.id}`, {
             checkedAt: new Date().toISOString(),
           });
       } catch (error) {
@@ -545,52 +483,31 @@ export async function runCollection(job: Job) {
         };
         console.warn("Duplicate check failed", diagnostic);
         // Failure to save diagnostics must not fail the completed message import.
-        await store.put("control", "dedup:last-error", diagnostic).catch(() => {});
+        await store
+          .put("control", "dedup:last-error", diagnostic)
+          .catch(() => {});
         errors.push(
           `Не удалось проверить накопленные повторы. ${diagnostic.detail} Повторим при следующем сборе.`,
         );
         break;
       }
     }
-    const visible = (await store.list<Offer>("offer")).filter(
-      (o) => !o.duplicateOf && o.day === job.day && o.match !== "no",
+    calls = await personalize({ job, control, calls, report, errors });
+    const failed =
+      errors.length > 0 &&
+      processed === 0 &&
+      (await store.list("catalog")).length === 0;
+    await personalDigests(
+      job,
+      failed ? { ...digest, status: "failed" } : digest,
+      errors,
+      control,
     );
-    let summary = visible.length
-      ? `Найдено предложений: ${visible.length}. Открой карточки, чтобы выбрать интересное.`
-      : "Новых подходящих опросов нет.";
-    if (visible.length && calls < config.maxCalls) {
-      calls++;
-      job.progress.phase = "summary";
-      job.progress.aiCalls = calls;
-      await report(true);
-      try {
-        summary = (await control.wait(summarize(visible, control.signal), "ИИ"))
-          .summary;
-      } catch {
-        control.check();
-        errors.push(
-          "Не удалось составить краткую сводку. Сами предложения доступны.",
-        );
-      }
-    }
-    const state: Digest["status"] = errors.length
-      ? processed || visible.length
-        ? "partial"
-        : "failed"
-      : "complete";
     control.check();
-    job.progress.phase = state === "failed" ? "failed" : "done";
-    await store.put("digest", digestId, {
-      ...digest,
-      status: state,
-      newCount: visible.length,
-      summary,
-      errors: [...new Set(errors)],
-      finishedAt: new Date().toISOString(),
-    });
+    job.progress.phase = failed ? "failed" : "done";
     await store.put("job", job.id, {
       ...job,
-      status: state === "failed" ? "failed" : "done",
+      status: failed ? "failed" : "done",
       attempts: job.attempts + 1,
       incomplete: errors.length > 0,
       error: errors.join(" "),
@@ -603,6 +520,9 @@ export async function runCollection(job: Job) {
         ? "user"
         : "timeout"
       : undefined;
+    await personalDigests(job, { ...digest, status: "failed" }, [
+      error instanceof Error ? error.message : "Ошибка сбора",
+    ]);
     await store.put("digest", digestId, {
       ...digest,
       status: "failed",
@@ -623,5 +543,5 @@ export async function runCollection(job: Job) {
     control.close();
     await release();
   }
-  return { added };
+  return { added: job.progress?.offersAdded || 0 };
 }

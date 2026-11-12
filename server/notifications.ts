@@ -11,7 +11,9 @@ export async function notify(day: string) {
     config.vapidPublic,
     config.vapidPrivate,
   );
-  const digest = await store.get<Digest>("digest", day);
+  const digest = (await store.list<Digest>("digest"))
+    .filter((d) => d.day === day)
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0];
   const body =
     !digest || digest.status === "running"
       ? "Подборка пока не готова. Проверь состояние сбора."
@@ -32,10 +34,10 @@ export async function notify(day: string) {
       await webpush.sendNotification(
         record.subscription,
         JSON.stringify({
-          title: "Твоя подборка в Отклике",
+          title: `Отклик · ${(await store.get<{ name: string }>("user", store.userId))?.name || "Подборка"}`,
           body,
-          url: `/?day=${day}`,
-          tag: `digest-${day}`,
+          url: `/?day=${day}&account=${store.userId}`,
+          tag: `digest-${store.userId}-${day}`,
         }),
         { TTL: 86400 },
       );

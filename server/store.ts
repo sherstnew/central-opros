@@ -1,8 +1,11 @@
 import { MongoClient, MongoServerError, type Collection } from "mongodb";
 import { config } from "./config";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 type Table =
+  | "user"
+  | "catalog"
   | "profile"
   | "source"
   | "message"
@@ -31,6 +34,26 @@ export function databaseName(uri: string, override?: string) {
 }
 
 export class Store {
+  private context = new AsyncLocalStorage<string>();
+  as<T>(userId: string, work: () => T): T {
+    return this.context.run(userId, work);
+  }
+  get userId() {
+    return this.context.getStore() || "owner";
+  }
+  private scoped(table: Table, id?: string) {
+    return (
+      ["offer", "feedback", "digest", "subscription"].includes(table) ||
+      (table === "profile" && id !== "settings")
+    );
+  }
+  private key(table: Table, id: string) {
+    if (this.scoped(table, id) && id.startsWith("user:"))
+      throw Object.assign(new Error("Запись не найдена"), { statusCode: 404 });
+    return this.scoped(table, id) && this.userId !== "owner"
+      ? `user:${this.userId}:${id}`
+      : id;
+  }
   private memory = new Map<string, Map<string, unknown>>();
   private readonly client: MongoClient | null;
   private readonly database;
@@ -51,22 +74,42 @@ export class Store {
     return this.database?.collection<RecordDocument>(table);
   }
   async list<T>(table: Table): Promise<T[]> {
+    const prefix =
+      this.scoped(table) && this.userId !== "owner"
+        ? `user:${this.userId}:`
+        : null;
+    const scoped = this.scoped(table);
     const collection = this.collection(table);
     if (collection)
       return (
-        await collection.find({}, { projection: { data: 1 } }).toArray()
+        await collection
+          .find(
+            scoped
+              ? { _id: prefix ? { $regex: `^${prefix}` } : { $not: /^user:/ } }
+              : {},
+            { projection: { data: 1 } },
+          )
+          .toArray()
       ).map((record) => record.data as T);
     return structuredClone([
-      ...(this.memory.get(table)?.values() || []),
+      ...[...(this.memory.get(table)?.entries() || [])]
+        .filter(
+          ([id]) =>
+            !scoped ||
+            (prefix ? id.startsWith(prefix) : !id.startsWith("user:")),
+        )
+        .map(([, value]) => value),
     ]) as T[];
   }
   async get<T>(table: Table, id: string): Promise<T | null> {
+    id = this.key(table, id);
     const collection = this.collection(table);
     if (collection)
       return ((await collection.findOne({ _id: id }))?.data as T) ?? null;
     return structuredClone(this.memory.get(table)?.get(id) ?? null) as T | null;
   }
   async put<T>(table: Table, id: string, data: T): Promise<void> {
+    id = this.key(table, id);
     const clean = JSON.parse(JSON.stringify(data));
     const collection = this.collection(table);
     if (collection) {
@@ -82,6 +125,7 @@ export class Store {
     this.memory.get(table)!.set(id, clean);
   }
   async remove(table: Table, id: string) {
+    id = this.key(table, id);
     const collection = this.collection(table);
     if (collection) await collection.deleteOne({ _id: id });
     else this.memory.get(table)?.delete(id);
