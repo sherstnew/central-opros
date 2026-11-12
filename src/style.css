@@ -2398,3 +2398,6 @@ label small {
 .channel-load-error {
   padding: 8px 0;
 }
+
+.feed-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.manual-fields { border: 0; padding: 0; margin: 16px 0; min-width: 0; }

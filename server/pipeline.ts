@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { store } from "./store";
 import { config } from "./config";
 import { analyze, evaluate, summarize, findDuplicates } from "./ai";
-import { hardMismatch, dedupCandidate, duplicateCandidates } from "./matching";
+import { hardMismatch, dedupCandidate, duplicateCandidates, MATCHING_VERSION } from "./matching";
 import { mergeDuplicates } from "./dedup";
 import { telegramClient } from "./telegram";
 import { sourceEntity, sourceMessageUrl } from "./channels";
@@ -60,6 +60,7 @@ export async function enqueueCollection(
     lookbackDays?: number;
     now?: Date;
     resumeJobId?: string;
+    scheduledSlot?: string;
   } = {},
 ) {
   if (options.resumeJobId) {
@@ -92,7 +93,7 @@ export async function enqueueCollection(
   }
   const id = options.manual
     ? `collect:manual:${randomUUID()}`
-    : `collect:${day}`;
+    : `collect:${day}${options.scheduledSlot ? `:${options.scheduledSlot}` : ""}`;
   const job = await store.get<Job>("job", id);
   if (job && ["pending", "running"].includes(job.status)) return job;
   const next: Job = {
@@ -305,9 +306,7 @@ export async function runCollection(job: Job) {
         (await store.get<Profile>("profile", "owner")) ||
         profileSchema.parse({}),
       feedback = await store.list<Feedback>("feedback");
-    const revision =
-      (await store.get<{ value: string }>("profile", "revision"))?.value ||
-      "initial";
+    const revision = `${MATCHING_VERSION}:${(await store.get<{ value: string }>("profile", "revision"))?.value || "initial"}`;
     const active = new Set(sources.map((s) => s.id));
     const messages = (await store.list<RawMessage>("message"))
       .filter(
@@ -366,7 +365,7 @@ export async function runCollection(job: Job) {
                 }
               : { match, reasons, questions, score };
           const offers = (await store.list<Offer>("offer")).filter(
-            (o) => !o.duplicateOf,
+            (o) => !o.duplicateOf && !o.manuallyAdded,
           );
           const fromMessage = offers.filter((o) =>
             o.sources.some((s) => s.messageId === message.id),
@@ -449,7 +448,7 @@ export async function runCollection(job: Job) {
     const stale = (await store.list<Offer>("offer"))
       .filter(
         (o) =>
-          !o.duplicateOf && o.stage === "new" && o.matchVersion !== revision,
+          !o.duplicateOf && !o.manuallyAdded && o.stage === "new" && o.matchVersion !== revision,
       )
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     job.progress.recheckTotal = stale.length;
@@ -504,7 +503,7 @@ export async function runCollection(job: Job) {
     }
     // One-time semantic cleanup of accumulated offers, resumable within the call budget.
     const unchecked = (await store.list<Offer>("offer"))
-      .filter((o) => !o.duplicateOf)
+      .filter((o) => !o.duplicateOf && !o.manuallyAdded)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     for (const offer of unchecked) {
       if (calls >= config.maxCalls) break;

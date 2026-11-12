@@ -9,6 +9,15 @@ afterAll(async () => {
   await app.close();
 });
 describe("Личный сценарий", () => {
+  it("добавляет объявление вручную без ИИ и проверяет ввод", async () => {
+    const payload = { title: "Вода со вкусом", summary: "800 ₽ сертификатом Ozon, метро Марксистская", reward: 800, duration: 40, format: "offline", city: "Москва", dateLabel: "12 ноября, 13:00 или 15:20" };
+    const r = await app.inject({ method: "POST", url: "/api/offers", headers, payload });
+    expect(r.statusCode).toBe(200);
+    const state = (await app.inject({ url: "/api/state" })).json();
+    expect(state.offers.find((o: any) => o.id === r.json().id)).toMatchObject({ ...payload, manuallyAdded: true, match: "maybe", stage: "new" });
+    for (const bad of [{ ...payload, title: " " }, { ...payload, reward: -1 }, { ...payload, applyUrl: "javascript:alert(1)" }])
+      expect((await app.inject({ method: "POST", url: "/api/offers", headers, payload: bad })).statusCode).toBe(400);
+  });
   it("проверяет период ручного сбора до запуска", async () => {
     for (const lookbackDays of [0, 31, 1.5])
       expect(

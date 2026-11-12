@@ -1,4 +1,12 @@
 import type { Extracted, Feedback, Offer, Profile } from "../shared/model";
+export const MATCHING_VERSION = "city-v2";
+// The city field may contain a venue after a comma or a metro qualifier.
+export function normalizedCity(value: string) {
+  return value.toLocaleLowerCase("ru").replace(/ё/g, "е")
+    .replace(/^\s*(?:г(?:ород)?\.?\s+)/, "")
+    .split(/[,;\n(]|\s+(?:метро|м\.|у метро)\s/)[0]
+    .replace(/[«»".]/g, "").trim().replace(/\s+/g, " ");
+}
 export function ageAt(birthDate: string, now = new Date()) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) return null;
   const d = new Date(`${birthDate}T12:00:00Z`);
@@ -39,8 +47,7 @@ export function hardMismatch(
     offer.format === "offline" &&
     offer.city &&
     profile.city &&
-    offer.city.toLocaleLowerCase("ru").trim() !==
-      profile.city.toLocaleLowerCase("ru").trim()
+    normalizedCity(offer.city) !== normalizedCity(profile.city)
   )
     return "Другой город";
   return null;
@@ -73,7 +80,7 @@ export function duplicateCandidates(text: string, offers: Offer[], limit = 20) {
       .match(/[\p{L}\p{N}]{4,}/gu)
       ?.reduce((n, w) => n + Number(words.has(w)), 0) || 0;
   return offers
-    .filter((o) => !o.duplicateOf)
+    .filter((o) => !o.duplicateOf && !o.manuallyAdded)
     .map((o) => ({ o, rank: rank(o) }))
     .sort(
       (a, b) => b.rank - a.rank || b.o.updatedAt.localeCompare(a.o.updatedAt),

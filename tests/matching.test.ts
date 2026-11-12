@@ -34,6 +34,13 @@ const extracted = extractedSchema.parse({
   dedupKey: "banks-interview-2026",
 });
 describe("Подбор по подтверждённым фактам", () => {
+  it("не отвергает Москву с уточнением метро, но различает другие города", () => {
+    const p = profileSchema.parse({ city: "Москва" });
+    for (const city of ['Москва, метро «Марксистская»', 'г. Москва', 'Москва (Марксистская)', 'Москва метро Марксистская'])
+      expect(hardMismatch({ ...extracted, format: "offline", city }, p)).toBeNull();
+    for (const city of ["Казань", "Московский", "Московская область"])
+      expect(hardMismatch({ ...extracted, format: "offline", city }, p)).toBe("Другой город");
+  });
   it("считает возраст до и после дня рождения", () => {
     expect(ageAt("2000-11-11", new Date("2026-11-10"))).toBe(25);
     expect(ageAt("2000-11-10", new Date("2026-11-10T12:00:00Z"))).toBe(26);

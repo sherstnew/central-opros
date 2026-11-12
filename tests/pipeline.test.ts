@@ -7,6 +7,7 @@ import {
   cancelCollection,
 } from "../server/pipeline";
 import { config } from "../server/config";
+import { MATCHING_VERSION } from "../server/matching";
 import {
   extractedSchema,
   profileSchema,
@@ -129,6 +130,18 @@ beforeEach(async () => {
   });
 });
 describe("Восстановление сбора и пользовательские действия", () => {
+  it("восстанавливает ошибочный отказ по метро после обновления правил, сохраняя ручные карточки", async () => {
+    await runCollection(job());
+    const original = (await store.list<Offer>("offer"))[0];
+    await store.put("profile", "owner", profileSchema.parse({city: "Москва"}));
+    await store.put("offer", original.id, { ...original, format: "offline", city: "Москва, метро «Марксистская»", match: "no", reasons: ["Другой город"], matchVersion: "initial" });
+    const manual: Offer = { ...original, id: "manual-test", manuallyAdded: true, title: "Ручной опрос", matchVersion: "initial", note: "Моя запись" };
+    await store.put("offer", manual.id, manual);
+    await runCollection(job());
+    expect(await store.get("offer", original.id)).toMatchObject({ match: "yes", matchVersion: `${MATCHING_VERSION}:initial` });
+    expect(await store.get("offer", manual.id)).toEqual(manual);
+    expect(mock.evaluate).toHaveBeenCalledTimes(1);
+  });
   it("обрабатывает несколько опросов одним вызовом при лимите в один запрос", async () => {
     const previousLimit = config.maxCalls;
     config.maxCalls = 1;
@@ -449,7 +462,7 @@ describe("Восстановление сбора и пользовательс�
     await runCollection(job());
     const offer = (await store.list<Offer>("offer"))[0];
     expect(offer.match).toBe("maybe");
-    expect(offer.matchVersion).toBe("changed");
+    expect(offer.matchVersion).toBe(`${MATCHING_VERSION}:changed`);
   });
   it("не запускает две обработки одновременно", async () => {
     const release = await store.lock("collection");

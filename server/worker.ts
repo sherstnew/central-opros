@@ -18,13 +18,15 @@ export async function tick(now = new Date()) {
       hour12: false,
     }).format(now);
   const settings =
-    (await store.get<Settings>("profile", "settings")) ||
-    settingsSchema.parse({});
+    settingsSchema.parse((await store.get<Settings>("profile", "settings")) || {});
   if (
     time >= settings.collectionTime &&
     !(await store.get("job", `collect:${day}`))
   )
     await enqueueCollection(day, { now });
+  if (time >= settings.eveningCollectionTime &&
+      !(await store.get("job", `collect:${day}:evening`)))
+    await enqueueCollection(day, { now, scheduledSlot: "evening" });
   for (const job of await store.list<Job>("job")) {
     if (job.kind !== "collect" || !["pending", "running"].includes(job.status))
       continue;

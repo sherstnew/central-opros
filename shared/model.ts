@@ -35,6 +35,7 @@ export const profileSchema = z.object({
 });
 export type Profile = z.infer<typeof profileSchema>;
 export const settingsSchema = z.object({
+  eveningCollectionTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).default("21:00"),
   collectionTime: z
     .string()
     .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
@@ -98,6 +99,7 @@ export const extractedSchema = z.object({
 });
 export type Extracted = z.infer<typeof extractedSchema>;
 export interface Offer extends Extracted {
+  manuallyAdded?: boolean;
   id: string;
   createdAt: string;
   updatedAt: string;
@@ -200,6 +202,16 @@ export interface AppData {
   ai: { configured: boolean; model: string };
   push: { configured: boolean; publicKey: string };
 }
+export const manualOfferSchema = z.object({
+  title: z.string().trim().min(1, "Укажи тему опроса").max(200),
+  summary: z.string().trim().min(1, "Вставь текст объявления").max(1500),
+  reward: z.number().min(0).max(10000000).nullable(),
+  duration: z.number().positive().max(10080).nullable(),
+  format: z.enum(["online", "offline", "unknown"]).default("unknown"),
+  city: z.string().trim().max(100).nullable().default(null),
+  dateLabel: z.string().trim().max(160).nullable().default(null),
+  applyUrl: z.string().url().max(2048).refine(v => /^https?:\/\//i.test(v), "Нужна ссылка http или https").nullable().default(null),
+});
 export const offerPatchSchema = z.object({
   stage: stageSchema.optional(),
   note: z.string().max(5000).optional(),

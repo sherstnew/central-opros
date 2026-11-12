@@ -20,6 +20,16 @@ beforeEach(async () => {
   for (const j of await store.list<Job>("job")) await store.remove("job", j.id);
 });
 describe("Ночное расписание", () => {
+  it("добавляет вечерний сбор в 21:00 МСК независимо от утреннего", async () => {
+    await tick(new Date("2026-11-12T17:59:00Z"));
+    expect(await store.get("job", "collect:2026-11-12:evening")).toBeNull();
+    await tick(new Date("2026-11-12T18:00:00Z"));
+    const evening = await store.get<Job>("job", "collect:2026-11-12:evening");
+    expect(evening?.status).toBe("done");
+    expect(evening?.window?.since).toBe("2026-11-11T18:00:00.000Z");
+    await tick(new Date("2026-11-12T18:01:00Z"));
+    expect(await store.list("job")).toHaveLength(2);
+  });
   it("использует московскую дату, включая границу UTC-суток", () =>
     expect(moscowDay(new Date("2026-11-10T22:00:00Z"))).toBe("2026-11-11"));
   it("запускает сбор после 03:00 МСК и не повторяет готовое задание", async () => {

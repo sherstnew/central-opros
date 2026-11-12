@@ -30,6 +30,7 @@ import {
   feedbackSchema,
   sourceInputSchema,
   collectionInputSchema,
+  manualOfferSchema,
   moscowDay,
   type Offer,
   type Profile,
@@ -167,8 +168,7 @@ export async function createServer() {
     profile:
       (await store.get<Profile>("profile", "owner")) || profileSchema.parse({}),
     settings:
-      (await store.get<Settings>("profile", "settings")) ||
-      settingsSchema.parse({}),
+      settingsSchema.parse((await store.get<Settings>("profile", "settings")) || {}),
     offers: (await store.list<Offer>("offer")).filter((o) => !o.duplicateOf),
     sources: await store.list<Source>("source"),
     feedback: await store.list<Feedback>("feedback"),
@@ -201,6 +201,22 @@ export async function createServer() {
   app.put("/api/settings", async (req) => {
     await store.put("profile", "settings", settingsSchema.parse(req.body));
     return { ok: true };
+  });
+  app.post("/api/offers", async (req) => {
+    const input = manualOfferSchema.parse(req.body);
+    const id = randomUUID(), now = new Date().toISOString();
+    const offer: Offer = {
+      ...input, id, isSurvey: true, manuallyAdded: true,
+      createdAt: now, updatedAt: now, day: moscowDay(), stage: "new",
+      match: "maybe", reasons: ["Добавлено вручную"], questions: [], score: 50,
+      currency: "RUB", startsAt: null, deadline: null,
+      requirements: [], category: "Другое", ageMin: null, ageMax: null,
+      gender: null, organizer: null, dedupKey: `manual:${id}`,
+      sources: [{ messageId: `manual:${id}`, name: "Добавлено вручную", url: input.applyUrl || "", text: input.summary }],
+      note: "", participationDate: null, actualReward: null,
+    };
+    await store.put("offer", id, offer);
+    return { id, day: offer.day };
   });
   app.patch<{ Params: { id: string } }>("/api/offers/:id", async (req) => {
     const patch = offerPatchSchema.parse(req.body),

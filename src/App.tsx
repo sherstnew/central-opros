@@ -329,7 +329,7 @@ export default function App() {
           </Link>
           <Link to="/settings?tab=notifications">
             <Clock3 size={16} />
-            <span>Сбор {data.settings.collectionTime} МСК</span>
+            <span>Сбор {data.settings.collectionTime} и {data.settings.eveningCollectionTime} МСК</span>
           </Link>
         </div>
         <Link className="archive-link" to="/hidden">
@@ -538,6 +538,7 @@ function Feed({ data, refresh, notify }: Common) {
     }
   }
   const [collectionOpen, setCollectionOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [params, setParams] = useSearchParams(),
     [filter, setFilter] = useState("all"),
@@ -592,6 +593,8 @@ function Feed({ data, refresh, notify }: Common) {
           <div className="date-line">{prettyDay(day)}</div>
           <h1>Лента</h1>
         </div>
+        <div className="feed-actions">
+        <button className="secondary" onClick={() => setManualOpen(true)}><Plus size={17} />Добавить</button>
         <button
           className="secondary collect-button"
           onClick={() => setCollectionOpen(true)}
@@ -600,6 +603,7 @@ function Feed({ data, refresh, notify }: Common) {
           <I icon={RefreshCw} size={17} />
           <span>Собрать</span>
         </button>
+        </div>
       </div>
       {data.jobs.some(
         (j) =>
@@ -787,6 +791,7 @@ function Feed({ data, refresh, notify }: Common) {
         />
       )}
       {details && <Details offer={details} onClose={() => setDetails(null)} />}
+      {manualOpen && <ManualOfferModal onClose={() => setManualOpen(false)} onAdded={async (day) => { setParams({ day }); await refresh(); setManualOpen(false); notify("Опрос добавлен"); }} />}
       {collectionOpen && (
         <CollectionModal
           data={data}
@@ -797,6 +802,41 @@ function Feed({ data, refresh, notify }: Common) {
       )}
     </main>
   );
+}
+
+function ManualOfferModal({ onClose, onAdded }: { onClose: () => void; onAdded: (day: string) => Promise<void> }) {
+  const [form, setForm] = useState({ title: "", summary: "", reward: "", duration: "", city: "", dateLabel: "", applyUrl: "", format: "unknown" });
+  const [busy, setBusy] = useState(false), [error, setError] = useState("");
+  const set = (key: keyof typeof form, value: string) => setForm(f => ({ ...f, [key]: value }));
+  async function submit(e: FormEvent) {
+    e.preventDefault(); setBusy(true); setError("");
+    try {
+      const result = await api<{day: string}>("/offers", "POST", { ...form,
+        reward: form.reward === "" ? null : Number(form.reward),
+        duration: form.duration === "" ? null : Number(form.duration),
+        city: form.city || null, dateLabel: form.dateLabel || null, applyUrl: form.applyUrl || null });
+      await onAdded(result.day);
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  }
+  return <Modal title="Добавить опрос" onClose={onClose}>
+    <form onSubmit={submit}>
+      <p className="helper">Опрос появится в ленте за сегодня. Условия можно перенести из объявления без ИИ.</p>
+      <fieldset disabled={busy} className="manual-fields">
+        <label>Тема<input required maxLength={200} value={form.title} onChange={e => set("title", e.target.value)} /></label>
+        <label>Текст объявления<textarea required rows={6} maxLength={1500} value={form.summary} onChange={e => set("summary", e.target.value)} /></label>
+        <div className="form-grid">
+          <label>Вознаграждение, ₽<input type="number" min="0" max="10000000" value={form.reward} onChange={e => set("reward", e.target.value)} /></label>
+          <label>Длительность, мин<input type="number" min="1" max="10080" value={form.duration} onChange={e => set("duration", e.target.value)} /></label>
+          <label>Формат<select value={form.format} onChange={e => set("format", e.target.value)}><option value="unknown">Не указан</option><option value="offline">Очно</option><option value="online">Онлайн</option></select></label>
+          <label>Город<input maxLength={100} value={form.city} onChange={e => set("city", e.target.value)} /></label>
+        </div>
+        <label>Дата и варианты времени<input maxLength={160} value={form.dateLabel} onChange={e => set("dateLabel", e.target.value)} placeholder="12 ноября, 13:00 или 15:20 МСК" /></label>
+        <label>Ссылка на объявление или запись<input type="url" maxLength={2048} value={form.applyUrl} onChange={e => set("applyUrl", e.target.value)} placeholder="https://t.me/…" /></label>
+      </fieldset>
+      {error && <p className="error" role="alert">{error}</p>}
+      <button className="primary full-width" disabled={busy}>{busy ? "Добавляем…" : "Добавить в ленту"}</button>
+    </form>
+  </Modal>;
 }
 
 function CollectionModal({
@@ -2769,6 +2809,10 @@ function Notifications({ data, refresh, notify }: Common) {
                 setSettings((s) => ({ ...s, collectionTime: e.target.value }))
               }
             />
+          </label>
+          <label>
+            Вечерний сбор, МСК
+            <input type="time" required value={settings.eveningCollectionTime} onChange={e => setSettings(s => ({ ...s, eveningCollectionTime: e.target.value }))} />
           </label>
           <label>
             Ежедневная сводка, МСК
